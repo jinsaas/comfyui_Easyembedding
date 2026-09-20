@@ -1,0 +1,5 @@
+COLOR_MAP = {
+    "A": (255, 0, 0),   # R → bubble outer color
+    "B": (0, 255, 0),   # G →bubble lines
+    "C": (0, 0, 255),   # B →bubble inner
+}
