@@ -30,6 +30,9 @@ requirements.txt를 빈 파일로 유지합니다.
 
 python -m pip install --no-deps torchvision
 python -m pip install --no-deps deep-translator beautifulsoup4
+-추가. 기존 임베딩팩 사용하던 사람은 밑의 항목을 인스톨하시기 바랍니다.이미지 내의 텍스트를 읽어오는 노드 관련입니다.
+python -m pip install --no-deps easyocr
+python -m pip install --no-deps python-bidi
 
 ## Easy Embedding V 0.0.7 업데이트 정보##
 gc(가비지 코드)를 통해 샘플링 노드는 다음단계로 진행할 때마다 실시간으로 진행물 정보를 지웁니다. 
