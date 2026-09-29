@@ -3370,6 +3370,7 @@ class AutoMaskPrep(IO.ComfyNode):
                 IO.Float.Input("amp_setting", default=1.000, min=0.000, max=1.999, step=0.001, tooltip="앰플리피케이션 적용치"),
                 IO.Combo.Input("set_maskdim", options=["2dim","3dim","4dim"], default="4dim", tooltip="마스크 ndim 세팅"),
                 IO.Float.Input("alpha_setting", default=1.0, min=0.0, max=1.0, step=0.1, tooltip="알파 강도 적용치"),
+                IO.Float.Input("threshold_val", default=0.5, min=0.0, max=1.0, step=0.01, tooltip="마스크 판정을 내릴 임계값 (0에 가까울수록 넓게, 1에 가까울수록 좁게 잡음)"),
                 IO.Boolean.Input("binary_switch", default=True, tooltip="마스크 경계를 깔끔하게 0과 1의 이진 데이터로 고정할지를 확인합니다."),
                 IO.Combo.Input("output_switch", options=["dict_mask","mask_tensor"], default="mask_tensor", tooltip="마스크 출력 옵션"),
                 IO.Boolean.Input("show_preview", default=False, tooltip="프리뷰 표시 여부"),
@@ -3382,7 +3383,7 @@ class AutoMaskPrep(IO.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, target_image, bg_removal_model=None, guide_mask=None, set_mask="default", area_adjust="default", min_boxsize=50, amp_setting=1.000, set_maskdim="4dim", alpha_setting=1.0, binary_switch=True, output_switch="mask_tensor", show_preview=False) -> IO.NodeOutput:
+    def execute(cls, target_image, bg_removal_model=None, guide_mask=None, set_mask="default", area_adjust="default", min_boxsize=50, amp_setting=1.000, set_maskdim="4dim", alpha_setting=1.0, threshold_val=0.5, binary_switch=True, output_switch="mask_tensor", show_preview=False) -> IO.NodeOutput:
 
         cls.show_data_preparation_progress("start")
         total_steps = 5
