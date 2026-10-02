@@ -3402,8 +3402,7 @@ class AutoMaskPrep(IO.ComfyNode):
             if guide_mask is not None:
                 print(f"{CYAN}{BOLD}[AutoMaskPrep]{RESET} Since bg_removal_model is connected, guide_mask is ignored.")
                 pass
-            image_sample = image.permute(0, 2, 3, 1)
-            samp_mask = bg_removal_model.encode_image(image_sample)
+            samp_mask = bg_removal_model.encode_image(image)
             samp_mask = samp_mask.unsqueeze(1)
             if samp_mask.dim() == 4:
                 if samp_mask.shape[3] <= 4 and samp_mask.shape[3] < samp_mask.shape[1] and samp_mask.shape[3] < samp_mask.shape[2]:
