@@ -4098,6 +4098,7 @@ class EasyencoderChecker(IO.ComfyNode):
         
         for d in clip_dirs:
             path = os.path.join(d, clip_name)
+            clip_path = path
             if os.path.exists(path):
                 if path.endswith(".pt"):
                     loaded = torch.load(path, map_location="cpu")
