@@ -5289,15 +5289,15 @@ class EasyInpaintAndConditioning(IO.ComfyNode):
         mask_tensor = cls.sanitize_input_mask(mask)          # (B, 1, H, W)
 
         downscale_ratio = 8
-
+        
         if pixels.dim() == 4:
-            if pixels.shape[-1] == 3:  # [B, H, W, C]
-                b, h, w, c = pixels.shape
-            else:  # [B, C, H, W]
+            if pixels.shape[1] <= 4 and pixels.shape[3] > 4:  # [B, C, H, W]
                 b, c, h, w = pixels.shape
                 pixels = pixels.permute(0, 2, 3, 1) # [B, H, W, C]
+            else:   # [B, H, W, C]
+                b, h, w, c = pixels.shape
         else:
-            b, h, w, c = pixels.shape
+            b, h, w, c = pixels.shape # [B, H, W, C]
 
  
         x = (w // downscale_ratio) * downscale_ratio
@@ -5321,7 +5321,7 @@ class EasyInpaintAndConditioning(IO.ComfyNode):
             kernel_tensor = torch.ones((1, 1, grow_mask_by, grow_mask_by), device=mask_tensor.device)
             padding = math.ceil((grow_mask_by - 1) / 2)
             mask_erosion = torch.clamp(F.conv2d(mask_tensor.round(), kernel_tensor, padding=padding), 0, 1)
-        p_h, p_w = (pixels.shape[1], pixels.shape[2]) if pixels.shape[-1] == 3 else (pixels.shape[2], pixels.shape[3])
+        p_h, p_w = pixels.shape[1], pixels.shape[2]
 
         if mask_erosion.shape[-2] > p_h or mask_erosion.shape[-1] > p_w:
             mask_erosion = mask_erosion[:, :, :p_h, :p_w]
@@ -5403,7 +5403,6 @@ class EasyInpaintAndConditioning(IO.ComfyNode):
         if preview_mode:
             return IO.NodeOutput(out_positive, out_negative, out_latent, blend_latent, ui=UI.PreviewImage(concat_pixels))
         return IO.NodeOutput(out_positive, out_negative, out_latent, blend_latent)
-
 
 #----------------------------------------
 
