@@ -1,3 +1,8 @@
+
+#----------------------------------------
+# Moduler code
+#----------------------------------------
+
 import os
 import torch
 import folder_paths
