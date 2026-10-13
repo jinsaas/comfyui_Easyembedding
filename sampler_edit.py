@@ -19,6 +19,18 @@ if TYPE_CHECKING:
     from comfy.model_patcher import ModelPatcher
     from comfy.model_base import BaseModel
     from comfy.controlnet import ControlBase
+import re
+
+def find_attn_modules(root, kind="self_attn"):
+    _ATTN_PAT = re.compile(r"(?:^|\.)(?:layers|blocks)\.(\d+)\.(self_attn|cross_attn)\.([qkv])_proj$")
+    found = {}
+    for name, _ in root.named_modules():
+        if "llm_adapter" in name:
+            continue
+        m = _ATTN_PAT.search(name)
+        if m and m.group(2) == kind:
+            found.setdefault(int(m.group(1)), {})[m.group(3)] = name
+    return found   # {0: {'q': ..., 'k': ..., 'v': ...}, 1: ...}
 
 def editcond_set_values_with_timestep_range(conditioning, values={}, start_percent=0.0, end_percent=1.0):
 
@@ -845,9 +857,15 @@ def edit_process_conds(model, noise, conds, device, latent_image=None, denoise_m
 
 
 class edit_CFGGuider:
-    def __init__(self, model_patcher: ModelPatcher):
+    def __init__(self, model_patcher: ModelPatcher, extra_model_options=None):
         self.model_patcher = model_patcher
-        self.model_options = model_patcher.model_options
+        self.model_options = comfy.model_patcher.create_model_options_clone(model_patcher.model_options)
+        if extra_model_options and extra_model_options.get("transformer_options"):
+            self.model_options["transformer_options"] = comfy.patcher_extension.merge_nested_dicts(
+                self.model_options.get("transformer_options", {}),
+                extra_model_options["transformer_options"],
+                copy_dict1=False
+            )
         self.original_conds = {}
         self.cfg = 1.0
 
@@ -976,14 +994,14 @@ class edit_CFGGuider:
         return output
 
 
-def edit_sample(model, noise, positive, negative, cfg, device, sampler, sigmas, model_options={}, latent_image=None, denoise_mask=None, callback=None, disable_pbar=False, seed=None):
-    cfg_guider = edit_CFGGuider(model)
+def edit_sample(model, noise, positive, negative, cfg, device, sampler, sigmas, model_options={}, latent_image=None, denoise_mask=None, callback=None, disable_pbar=False, seed=None, extra_model_options=None):
+    cfg_guider = edit_CFGGuider(model, extra_model_options)
     cfg_guider.set_conds(positive, negative)
     cfg_guider.set_cfg(cfg)
     return cfg_guider.sample(noise, latent_image, sampler, sigmas, denoise_mask, callback, disable_pbar, seed)
 
 
-def sample_custom_edit(model, noise, cfg, sampler, sigmas, positive, negative, latent_image, noise_mask=None, callback=None, disable_pbar=False, seed=None):
-    samples = edit_sample(model, noise, positive, negative, cfg, model.load_device, sampler, sigmas, model_options=model.model_options, latent_image=latent_image, denoise_mask=noise_mask, callback=callback, disable_pbar=disable_pbar, seed=seed)
+def sample_custom_edit(model, noise, cfg, sampler, sigmas, positive, negative, latent_image, noise_mask=None, callback=None, disable_pbar=False, seed=None, extra_model_options=None):
+    samples = edit_sample(model, noise, positive, negative, cfg, model.load_device, sampler, sigmas, model_options=model.model_options, latent_image=latent_image, denoise_mask=noise_mask, callback=callback, disable_pbar=disable_pbar, seed=seed, extra_model_options=extra_model_options)
     samples = samples.to(device=comfy.model_management.intermediate_device(), dtype=comfy.model_management.intermediate_dtype())
     return samples
