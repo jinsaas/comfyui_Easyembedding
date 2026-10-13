@@ -1,7 +1,7 @@
+
 #----------------------------------------
 # Main code
 #----------------------------------------
-
 import os
 import sys
 import torch
@@ -2030,6 +2030,7 @@ class EasyClipTextEncodeSimple(IO.ComfyNode):
                 IO.Combo.Input("output_settings", options=["conditioning", "embedding output"], default="conditioning", tooltip="출력설정"),
                 IO.String.Input("file_name", default="easyemb_%number", tooltip="파일명 지정"),
                 IO.Combo.Input("emb_opt", options=["basic", "textsave"], default="basic", tooltip="텍스트임베딩 프롬프트 기록 여부"),
+                IO.Boolean.Input("clamp_text", default=True, tooltip="텍스트 수치 클램핑 여부")
             ],
             is_output_node=True,
             outputs=[
@@ -2038,11 +2039,11 @@ class EasyClipTextEncodeSimple(IO.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, clip, prompt_text=None, output_settings="conditioning", file_name="easyemb_%number", emb_opt="basic") -> IO.NodeOutput:
+    def execute(cls, clip, prompt_text=None, output_settings="conditioning", file_name="easyemb_%number", emb_opt="basic", clamp_text=True) -> IO.NodeOutput:
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        cond = normalize_and_encode(clip, prompt_text, 1.0, device) if prompt_text else (None, 0)
+        cond = normalize_and_encode(clip, prompt_text, 1.0, device, clamp=clamp_text) if prompt_text else (None, 0)
 
         # layer count
         layer_count, layernames = get_layer_count(clip)
@@ -2096,7 +2097,7 @@ class EasyClipTextEncodeClamp(IO.ComfyNode):
                 IO.String.Input("prompt_text_raw", multiline=True, tooltip="프롬프트 입력란(음수 가능)"),
                 IO.Combo.Input("output_settings", options=["conditioning", "embedding output"], default="conditioning", tooltip="출력설정"),
                 IO.String.Input("file_name", default="easyemb_%number", tooltip="파일명 지정"),
-                IO.Combo.Input("emb_opt", options=["basic", "textsave"], default="basic", tooltip="텍스트임베딩 프롬프트 기록 여부"),
+                IO.Combo.Input("emb_opt", options=["basic", "textsave"], default="basic", tooltip="텍스트임베딩 프롬프트 기록 여부")
             ],
             is_output_node=True,
             outputs=[
@@ -2189,7 +2190,8 @@ class EasyClipTextEncodeTokenInfo(IO.ComfyNode):
                 IO.String.Input("neg_calltype", multiline=False, tooltip="부정 호출키.<호출타입:keyword:str>형태로 입력하세요."),
                 IO.Combo.Input("output_settings", options=["conditioning", "token_check"], default="conditioning", tooltip="출력설정"),
                 IO.Combo.Input("check_prompt", options=["off", "positive", "negative", "all"], default="off", tooltip="토큰 측정 대상 프롬프트 설정"),
-                IO.Combo.Input("manual_mode", options=["concat", "combine", "average"], default="concat", tooltip="컨디셔닝 결합방식")
+                IO.Combo.Input("manual_mode", options=["concat", "combine", "average"], default="concat", tooltip="컨디셔닝 결합방식"),
+                IO.Boolean.Input("clamp_text", default=True, tooltip="텍스트 수치 클램핑 여부.pos_keyword와 neg_keyword만 적용됩니다.")
             ],
             is_output_node=True,
             outputs=[
@@ -2201,7 +2203,7 @@ class EasyClipTextEncodeTokenInfo(IO.ComfyNode):
 
     @classmethod
     def execute(cls, clip, pos_keyword=None, neg_keyword=None, pos_text=None, pos_stylekey=None, pos_calltype=None, 
-                neg_stylekey=None, neg_calltype=None, output_settings="conditioning", check_prompt="off", manual_mode="concat") -> IO.NodeOutput:
+                neg_stylekey=None, neg_calltype=None, output_settings="conditioning", check_prompt="off", manual_mode="concat", clamp_text=True) -> IO.NodeOutput:
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -2211,7 +2213,7 @@ class EasyClipTextEncodeTokenInfo(IO.ComfyNode):
         pos_fields = []
 
         if pos_keyword and pos_keyword.strip():
-            pos_fields.append(normalize_and_encode(clip, pos_keyword, 1.0, device))
+            pos_fields.append(normalize_and_encode(clip, pos_keyword, 1.0, device, clamp=clamp_text))
         if pos_text and pos_text.strip():
             pos_fields.append(normalize_and_encode(clip, pos_text, 1.0, device))
         if pos_stylekey and pos_stylekey.strip():
@@ -2223,7 +2225,7 @@ class EasyClipTextEncodeTokenInfo(IO.ComfyNode):
         neg_fields = []
 
         if neg_keyword and neg_keyword.strip():
-            neg_fields.append(normalize_and_encode(clip, neg_keyword, 1.0, device))
+            neg_fields.append(normalize_and_encode(clip, neg_keyword, 1.0, device, clamp=clamp_text))
         if neg_stylekey and neg_stylekey.strip():
             neg_fields.append(normalize_and_encode(clip, neg_stylekey, 1.0, device))
         if neg_calltype and neg_calltype.strip():
@@ -2459,7 +2461,8 @@ class EasyClipTextEncodeADV(IO.ComfyNode):
                 IO.String.Input("neg_stylekey", multiline=False, tooltip="부정 스타일/아티스트. @형태로 입력합니다."),
                 IO.String.Input("neg_calltype", multiline=False, tooltip="부정 호출키.<호출타입:keyword:str>형태로 입력하세요."),
                 IO.String.Input("global_background", multiline=True, tooltip="전역 배경 프롬프트"),
-                IO.Combo.Input("manual_mode", options=["concat", "combine", "average"], default="concat", tooltip="컨디셔닝 결합방식")
+                IO.Combo.Input("manual_mode", options=["concat", "combine", "average"], default="concat", tooltip="컨디셔닝 결합방식"),
+                IO.Boolean.Input("clamp_text", default=True, tooltip="텍스트 수치 클램핑 여부.pos_keyword와 neg_keyword만 적용됩니다.")
             ],
             outputs=[
                 IO.Conditioning.Output("Pos_cond", tooltip="최종 Pos CLIP 조건"),
@@ -2470,7 +2473,7 @@ class EasyClipTextEncodeADV(IO.ComfyNode):
     @classmethod
     def execute(cls, clip, pos_keyword=None, neg_keyword=None, pos_text=None, pos_stylekey=None,
                 pos_calltype=None, neg_stylekey=None, neg_calltype=None, global_background=None, 
-                manual_mode="concat") -> IO.NodeOutput:
+                manual_mode="concat", clamp_text=True) -> IO.NodeOutput:
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -2484,7 +2487,7 @@ class EasyClipTextEncodeADV(IO.ComfyNode):
         pos_fields = []
 
         if pos_keyword and pos_keyword.strip():
-            pos_fields.append(normalize_and_encode(clip, pos_keyword, 1.0, device))
+            pos_fields.append(normalize_and_encode(clip, pos_keyword, 1.0, device, clamp=clamp_text))
         if pos_text and pos_text.strip():
             pos_fields.append(normalize_and_encode(clip, pos_text, 1.0, device))
         if pos_stylekey and pos_stylekey.strip():
@@ -2496,7 +2499,7 @@ class EasyClipTextEncodeADV(IO.ComfyNode):
 
         neg_fields = []
         if neg_keyword and neg_keyword.strip():
-            neg_fields.append(normalize_and_encode(clip, neg_keyword, 1.0, device))
+            neg_fields.append(normalize_and_encode(clip, neg_keyword, 1.0, device, clamp=clamp_text))
         if neg_stylekey and neg_stylekey.strip():
             neg_fields.append(normalize_and_encode(clip, neg_stylekey, 1.0, device))
         if neg_calltype and neg_calltype.strip():
@@ -2550,7 +2553,8 @@ class EasyClipTextMask(IO.ComfyNode):
                                default="5", tooltip="마스크 적용 강도.(1~30), 0.5~5.0으로 처리됩니다."),
                 IO.Combo.Input("extra_strength", options=["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20"], default="10",
                                 tooltip="마스크 외 영역 강도 (1~20), 0.1~1.0으로 처리됩니다."),
-                IO.Boolean.Input("set_area_to_bounds", default=False, tooltip="켰을 시 프롬프트 키워드가 마스크 영역 내에서만 처리되도록 영역을 제한합니다.")
+                IO.Boolean.Input("set_area_to_bounds", default=False, tooltip="켰을 시 프롬프트 키워드가 마스크 영역 내에서만 처리되도록 영역을 제한합니다."),
+                IO.Boolean.Input("clamp_text", default=True, tooltip="텍스트 수치 클램핑 여부.text만 적용됩니다.")
             ],
             outputs=[
                 IO.Conditioning.Output("conditioning", tooltip="최종 CLIP 조건")
@@ -2558,7 +2562,7 @@ class EasyClipTextMask(IO.ComfyNode):
         )		
 
     @classmethod
-    def execute(cls, clip, text, mask=None, style=None, resize_mask=False, cond_avg="skip", mask_strength="5", extra_strength="10", set_area_to_bounds=False) -> IO.NodeOutput:
+    def execute(cls, clip, text, mask=None, style=None, resize_mask=False, cond_avg="skip", mask_strength="5", extra_strength="10", set_area_to_bounds=False, clamp_text=True) -> IO.NodeOutput:
 
         if not text or not text.strip():
             print(f"{CYAN}{BOLD}[EasyClipTextMask]{RESET} Warning: The text is empty.")
@@ -2575,7 +2579,7 @@ class EasyClipTextMask(IO.ComfyNode):
         mask_fields = []
         stylecond = None
         if text and text.strip():
-            textcond = normalize_and_encode(clip, text, 1.0, device)
+            textcond = normalize_and_encode(clip, text, 1.0, device, clamp=clamp_text)
             mask_fields.append(textcond)
         if style and style.strip():
             stylecond = normalize_and_encode(clip, style, 1.0, device)
@@ -2656,7 +2660,8 @@ class EasyClipMultiTextMask(IO.ComfyNode):
                                default="5", tooltip="마스크 적용 강도.(1~30), 0.5~5.0으로 처리됩니다."),
                 IO.Combo.Input("extra_strength", options=["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20"], default="10",
                                 tooltip="마스크 외 영역 강도 (1~20), 0.1~1.0으로 처리됩니다."),
-                IO.Boolean.Input("set_area_to_bounds", default=False, tooltip="켰을 시 프롬프트 키워드가 마스크 영역 내에서만 처리되도록 영역을 제한합니다. 마스크가 두개일 경우는 충돌이 발생할 수 있습니다.")
+                IO.Boolean.Input("set_area_to_bounds", default=False, tooltip="켰을 시 프롬프트 키워드가 마스크 영역 내에서만 처리되도록 영역을 제한합니다. 마스크가 두개일 경우는 충돌이 발생할 수 있습니다."),
+                IO.Boolean.Input("clamp_text", default=True, tooltip="텍스트 수치 클램핑 여부.text만 적용됩니다.")
             ],
             outputs=[
                 IO.Conditioning.Output("conditioning", tooltip="최종 CLIP 조건")
@@ -2664,7 +2669,7 @@ class EasyClipMultiTextMask(IO.ComfyNode):
         )		
 
     @classmethod
-    def execute(cls, clip, text, mask=None, sub_text=None, sub_mask=None, style=None, resize_mask=False, cond_avg="skip", mask_strength="5", extra_strength="10", set_area_to_bounds=False) -> IO.NodeOutput:
+    def execute(cls, clip, text, mask=None, sub_text=None, sub_mask=None, style=None, resize_mask=False, cond_avg="skip", mask_strength="5", extra_strength="10", set_area_to_bounds=False, clamp_text=True) -> IO.NodeOutput:
 
         if not text or not text.strip():
             print(f"{CYAN}{BOLD}[EasyClipTextMask]{RESET} Warning: The text is empty.")
@@ -2678,7 +2683,7 @@ class EasyClipMultiTextMask(IO.ComfyNode):
         mask_fields = []
         stylecond = None
         if text and text.strip():
-            textcond = normalize_and_encode(clip, text, 1.0, device)
+            textcond = normalize_and_encode(clip, text, 1.0, device, clamp=clamp_text)
             mask_fields.append(textcond)
         if style and style.strip():
             stylecond = normalize_and_encode(clip, style, 1.0, device)
@@ -2795,6 +2800,7 @@ class EasyClipTextMaskNoArea(IO.ComfyNode):
                 IO.Combo.Input("extra_strength", options=["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20"], default="10",
                                 tooltip="마스크 외 영역 강도 (1~20), 0.1~1.0으로 처리됩니다."),
                 IO.Boolean.Input("maskbreaker", default=False, tooltip="대상이 공백 라텐트 캔버스일 경우에 사용합니다. 스타일(배경)과 텍스트의 적용 범위제한을 해제합니다. 훅 샘플러의 마스크 영역 제한을 해제하는데 사용됩니다."),
+                IO.Boolean.Input("clamp_text", default=True, tooltip="텍스트 수치 클램핑 여부.text만 적용됩니다.")
             ],
             outputs=[
                 IO.Conditioning.Output("conditioning", tooltip="최종 CLIP 조건")
@@ -2802,7 +2808,7 @@ class EasyClipTextMaskNoArea(IO.ComfyNode):
         )		
 
     @classmethod
-    def execute(cls, clip, text,style=None, mask=None, mask_mode="normal", resize_mask=True, cond_avg="skip", mask_strength="5", extra_strength="10", maskbreaker=False) -> IO.NodeOutput:
+    def execute(cls, clip, text, style=None, mask=None, mask_mode="normal", resize_mask=True, cond_avg="skip", mask_strength="5", extra_strength="10", maskbreaker=False, clamp_text=True) -> IO.NodeOutput:
 
         if not text or not text.strip():
             print(f"{CYAN}{BOLD}[EasyClipTextMask]{RESET} Warning: The text is empty.")
@@ -2816,7 +2822,7 @@ class EasyClipTextMaskNoArea(IO.ComfyNode):
         mask_fields = []
         stylecond = None
         if text and text.strip():
-            textcond = normalize_and_encode(clip, text, 1.0, device)
+            textcond = normalize_and_encode(clip, text, 1.0, device, clamp=clamp_text)
             mask_fields.append(textcond)
         if style and style.strip():
             stylecond = normalize_and_encode(clip, style, 1.0, device)
@@ -2954,7 +2960,8 @@ class EasyClipTextMask_And_Image_Using_Vision(IO.ComfyNode):
                                default="5", tooltip="마스크 적용 강도.(1~30), 0.5~5.0으로 처리됩니다."),
                 IO.Combo.Input("extra_strength", options=["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20"], default="10",
                                 tooltip="마스크 외 영역 강도 (1~20), 0.1~1.0으로 처리됩니다."),
-                IO.Boolean.Input("set_area_to_bounds", default=False, tooltip="켰을 시 프롬프트 키워드가 마스크 영역 내에서만 처리되도록 영역을 제한합니다.")
+                IO.Boolean.Input("set_area_to_bounds", default=False, tooltip="켰을 시 프롬프트 키워드가 마스크 영역 내에서만 처리되도록 영역을 제한합니다."),
+                IO.Boolean.Input("clamp_text", default=True, tooltip="텍스트 수치 클램핑 여부.text만 적용됩니다.")
             ],
             outputs=[
                 IO.Conditioning.Output("conditioning", tooltip="최종 CLIP 조건")
@@ -2962,7 +2969,7 @@ class EasyClipTextMask_And_Image_Using_Vision(IO.ComfyNode):
         )		
 
     @classmethod
-    def execute(cls, clip, text, style=None, mask=None, ref_Image=None, resize_mask=False, cond_avg="skip", mask_strength="5", extra_strength="10", set_area_to_bounds=False) -> IO.NodeOutput:
+    def execute(cls, clip, text, style=None, mask=None, ref_Image=None, resize_mask=False, cond_avg="skip", mask_strength="5", extra_strength="10", set_area_to_bounds=False, clamp_text=True) -> IO.NodeOutput:
 
         if not text or not text.strip():
             print(f"{CYAN}{BOLD}[EasyClipTextMask]{RESET} Warning: The text is empty.")
@@ -2985,7 +2992,7 @@ class EasyClipTextMask_And_Image_Using_Vision(IO.ComfyNode):
         mask_fields = []
         stylecond = None
         if text and text.strip():
-            textcond = normalize_and_encode(clip, text, 1.0, device)
+            textcond = normalize_and_encode(clip, text, 1.0, device, clamp=clamp_text)
             mask_fields.append(textcond)
         if style and style.strip():
             stylecond = normalize_and_encode(clip, style, 1.0, device)
@@ -3142,7 +3149,8 @@ class EasyClipTextMask_And_Image(IO.ComfyNode):
                                default="5", tooltip="마스크 적용 강도.(1~30), 0.5~5.0으로 처리됩니다."),
                 IO.Combo.Input("extra_strength", options=["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20"], default="10",
                                 tooltip="마스크 외 영역 강도 (1~20), 0.1~1.0으로 처리됩니다."),
-                IO.Boolean.Input("set_area_to_bounds", default=False, tooltip="켰을 시 프롬프트 키워드가 마스크 영역 내에서만 처리되도록 영역을 제한합니다.")
+                IO.Boolean.Input("set_area_to_bounds", default=False, tooltip="켰을 시 프롬프트 키워드가 마스크 영역 내에서만 처리되도록 영역을 제한합니다."),
+                IO.Boolean.Input("clamp_text", default=True, tooltip="텍스트 수치 클램핑 여부.text만 적용됩니다.")
             ],
             outputs=[
                 IO.Conditioning.Output("conditioning", tooltip="최종 CLIP 조건")
@@ -3150,7 +3158,7 @@ class EasyClipTextMask_And_Image(IO.ComfyNode):
         )		
 
     @classmethod
-    def execute(cls, clip, text, style=None, mask=None, ref_Image=None, style_type="Pass", resize_mask=False, cond_avg="skip", mask_strength="5", extra_strength="10", set_area_to_bounds=False) -> IO.NodeOutput:
+    def execute(cls, clip, text, style=None, mask=None, ref_Image=None, style_type="Pass", resize_mask=False, cond_avg="skip", mask_strength="5", extra_strength="10", set_area_to_bounds=False, clamp_text=True) -> IO.NodeOutput:
 
         if not text or not text.strip():
             print(f"{CYAN}{BOLD}[EasyClipTextMask]{RESET} Warning: The text is empty.")
@@ -3164,7 +3172,7 @@ class EasyClipTextMask_And_Image(IO.ComfyNode):
         mask_fields = []
         stylecond = None
         if text and text.strip():
-            textcond = normalize_and_encode(clip, text, 1.0, device)
+            textcond = normalize_and_encode(clip, text, 1.0, device, clamp=clamp_text)
             mask_fields.append(textcond)
         if style and style.strip():
             stylecond = normalize_and_encode(clip, style, 1.0, device)
@@ -3294,7 +3302,8 @@ class EasyClipTextMask_And_latent(IO.ComfyNode):
                 IO.Combo.Input("style_type", options=["Pass", "Latent_AdaIN", "Spatial_Attention", "Residual_Blending", "Channel_Selective"], default="Pass", tooltip="라텐트 가이딩 정보 유형"),
                 IO.Combo.Input("latent_mode", options=["default", "linear", "ease_in", "EASE_OUT", "EASE_IN_OUT"], default="default", tooltip="라텐트 가이딩 정보 유형"),
                 IO.Float.Input("Latent_activation_value", default=1.0, min=0.0, max=1.0, step=0.1, tooltip="라텐트 가이드 강도 (훅 영향력)"),
-                IO.Boolean.Input("set_area_to_bounds", default=False, tooltip="켰을 시 프롬프트 키워드가 마스크 영역 내에서만 처리되도록 영역을 제한합니다.")
+                IO.Boolean.Input("set_area_to_bounds", default=False, tooltip="켰을 시 프롬프트 키워드가 마스크 영역 내에서만 처리되도록 영역을 제한합니다."),
+                IO.Boolean.Input("clamp_text", default=True, tooltip="텍스트 수치 클램핑 여부.text만 적용됩니다.")
             ],
             outputs=[
                 IO.Conditioning.Output("conditioning", tooltip="최종 융합 조건")
@@ -3303,7 +3312,7 @@ class EasyClipTextMask_And_latent(IO.ComfyNode):
 
     @classmethod
     def execute(cls, clip, text, style=None, mask=None, ref_latent=None, resize_mask=False, cond_avg="combine", mask_strength="5", extra_strength="10",
-                transfer_str="0", style_type="Pass", latent_mode="default", Latent_activation_value=1.0, set_area_to_bounds=False) -> IO.NodeOutput:
+                transfer_str="0", style_type="Pass", latent_mode="default", Latent_activation_value=1.0, set_area_to_bounds=False, clamp_text=True) -> IO.NodeOutput:
 
         if not text or not text.strip():
             print(f"{CYAN}{BOLD}[EasyClipTextMask]{RESET} Warning: The text is empty.")
@@ -3315,7 +3324,7 @@ class EasyClipTextMask_And_latent(IO.ComfyNode):
         device = comfy.model_management.get_torch_device()
 
         # Prepare encoding source (initialize `stylecond` to `None` to prevent `NameError`)
-        textcond = normalize_and_encode(clip, text, 1.0, device)
+        textcond = normalize_and_encode(clip, text, 1.0, device, clamp=clamp_text)
         stylecond = normalize_and_encode(clip, style, 1.0, device) if style and style.strip() else None
 
         # layer count
