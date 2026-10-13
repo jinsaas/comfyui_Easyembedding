@@ -658,7 +658,7 @@ def progressbar_update(pbar, step, total_steps):
 #------------------------------------------------------
 # prompt settings
 #------------------------------------------------------
-def normalize_and_encode(clip, text, weight, device):
+def normalize_and_encode(clip, text, weight, device, clamp=True):
 
     if not text or not str(text).strip():
         model = clip.patcher.model
@@ -682,6 +682,15 @@ def normalize_and_encode(clip, text, weight, device):
         
         scaled_tensor = tensor * weight
         
+        cond_dict["weight"] = weight
+
+        if clamp:
+            weight = max(0.0, weight)
+            cond_dict["clamp_applied"] = True
+        else:
+            cond_dict["clamp_applied"] = False
+
+        scaled_tensor = tensor * weight
         cond_dict["weight"] = weight
 
         if "pooled_output" not in cond_dict or cond_dict["pooled_output"] is None:
@@ -1138,6 +1147,90 @@ def build_style_transfer_model_options(img_guide_options, sigmas, extra_options=
         
     return model_options
 
+def make_pose_mask(pose_coords, size, original_size=None, device=None):
+    """
+    포즈 좌표를 기반으로 특징맵 크기에 맞는 스페이셜 마스크를 생성합니다.
+    """
+    h, w = size
+    # device가 명시되지 않았다면 텐서의 디바이스를 기본으로 사용
+    if device is None:
+        device = torch.device("cpu")
+        
+    mask = torch.zeros(1, 1, h, w, device=device)
+    
+    if not pose_coords:
+        return mask
+
+    # 원본 이미지 크기와 현재 특징맵 크기 간의 비율 계산 (스케일링용)
+    # original_size가 없으면 1:1로 가정하되, 보통 원본 이미지 크기(p_h, p_w)를 넘겨주는 것이 좋습니다.
+    scale_h = h / original_size[0] if original_size and original_size[0] > 0 else 1.0
+    scale_w = w / original_size[1] if original_size and original_size[1] > 0 else 1.0
+
+    # 딕셔너리나 리스트 형태 모두 대응 가능하도록 안전하게 처리
+    items = pose_coords.items() if isinstance(pose_coords, dict) else enumerate(pose_coords)
+
+    for name, coord in items:
+        try:
+            if isinstance(coord, (list, tuple)) and len(coord) >= 2:
+                x, y = coord[0], coord[1]
+            elif isinstance(coord, dict):
+                x, y = coord.get("x", 0), coord.get("y", 0)
+            else:
+                continue
+
+            # 픽셀 좌표를 현재 라텐트/특징맵 크기에 맞게 스케일 변환
+            cx = int(x * scale_w)
+            cy = int(y * scale_h)
+
+            # 텐서 범위를 벗어나지 않도록 안전하게 슬라이싱 범위 지정
+            if 0 <= cx < w and 0 <= cy < h:
+                y1, y2 = max(0, cy - 2), min(h, cy + 3)
+                x1, x2 = max(0, cx - 2), min(w, cx + 3)
+                mask[:, :, y1:y2, x1:x2] = 1.0
+        except Exception:
+            continue
+
+    return mask
+
+
+def get_spatial_control_hooks(spatial_features, transfer_str, weight_map, latent_dim=None):
+    def apply_spatial_hook(q, k, v, extra_options):
+        guide_tensor = spatial_features.get("lat_features", None)
+        pose_coords = spatial_features.get("pose_coords", None)
+        if guide_tensor is None:
+            return q, k, v
+
+        step_idx = extra_options.get("transformer_options", {}).get("current_step", 0)
+        
+        if weight_map is not None and len(weight_map) > step_idx:
+            current_weight = weight_map[step_idx]
+            if isinstance(current_weight, torch.Tensor):
+                current_weight = current_weight.item()
+        else:
+            current_weight = transfer_str[step_idx] if hasattr(transfer_str, "__getitem__") and len(transfer_str) > step_idx else 1.0
+
+        if current_weight <= 0.0:
+            return q, k, v
+
+        v_target = v
+        ref_v = guide_tensor
+
+        if ref_v.shape[2:] != v_target.shape[2:]:
+            interp_mode = "trilinear" if latent_dim == 5 else "bilinear"
+            ref_v = F.interpolate(ref_v, size=v_target.shape[2:], mode=interp_mode, align_corners=False if interp_mode=="bilinear" else None)
+
+        # Space-Guided Attention/Blending Operations
+        spatial_mask = torch.sigmoid(ref_v.mean(dim=1, keepdim=True))
+        if pose_coords is not None:
+            pose_mask = make_pose_mask(pose_coords, v_target.shape[2:])
+            spatial_mask = spatial_mask * pose_mask
+
+        v_styled = v_target * (1.0 - spatial_mask * current_weight) + ref_v * (spatial_mask * current_weight)
+
+        return q, k, v_styled
+
+    return apply_spatial_hook
+
 def get_latent_transfer_hooks(transfer_str, style_type, ref_latent_features, weight_map, w=1.0, latent_shape=None, latent_dim=None):
     stat_dims = (3, 4) if latent_dim == 5 else (2, 3)
 
@@ -1203,20 +1296,34 @@ def get_latent_transfer_hooks(transfer_str, style_type, ref_latent_features, wei
     return apply_latent_hook
 
 def build_style_transfer_lat_model_options(latent_guide_options, sigmas, extra_options=None, noise_mask=None, latent_shape=None, latent_dim=None):
-    ref_weight = latent_guide_options.get("reference_weight", 1.00)
-    method = latent_guide_options.get("palette_mode", "ease_in_out")
-    style_type = latent_guide_options.get("ref_lat_style_type", "Pass")
-    latent_features = latent_guide_options.get("ref_latent_features", None)
-    transfer_str = latent_guide_options.get("ref_lat_transfer_str", 1.0)
 
-    max_val = float(ref_weight) * float(transfer_str)
-    device=sigmas.device
-    s_val = 0.00
-    e_val = float(max_val)
-    weights = calculate_custom_latent_weights(s_val, e_val, len(sigmas), method, device)
-    weight_map = weights.to(device=sigmas.device, dtype=torch.float32)
+    if "spatial_features" in latent_guide_options:
+        ref_weight = latent_guide_options.get("spatial_weight", 1.00)
+        transfer_str = latent_guide_options.get("spatial_transfer_str", 1.0)
+        spatial_features = latent_guide_options.get("spatial_features", None)
+        
+        max_val = float(ref_weight) * float(transfer_str)
+        device = sigmas.device
+        method = latent_guide_options.get("palette_mode", "ease_in_out")
+        weights = calculate_custom_latent_weights(0.00, float(max_val), len(sigmas), method, device)
+        weight_map = weights.to(device=sigmas.device, dtype=torch.float32)
 
-    style_hook_fn = get_latent_transfer_hooks(transfer_str, style_type, latent_features, weight_map, 1.0, latent_shape=latent_shape, latent_dim=latent_dim)
+        style_hook_fn = get_spatial_control_hooks(spatial_features, transfer_str, weight_map, latent_dim=latent_dim)
+    else:
+        ref_weight = latent_guide_options.get("reference_weight", 1.00)
+        method = latent_guide_options.get("palette_mode", "ease_in_out")
+        style_type = latent_guide_options.get("ref_lat_style_type", "Pass")
+        latent_features = latent_guide_options.get("ref_latent_features", None)
+        transfer_str = latent_guide_options.get("ref_lat_transfer_str", 1.0)
+
+        max_val = float(ref_weight) * float(transfer_str)
+        device = sigmas.device
+        s_val = 0.00
+        e_val = float(max_val)
+        weights = calculate_custom_latent_weights(s_val, e_val, len(sigmas), method, device)
+        weight_map = weights.to(device=sigmas.device, dtype=torch.float32)
+
+        style_hook_fn = get_latent_transfer_hooks(transfer_str, style_type, latent_features, weight_map, 1.0, latent_shape=latent_shape, latent_dim=latent_dim)
     
     def style_patch(args):
         sigma = args["sigma"]
@@ -1298,7 +1405,9 @@ def build_model_options(sigmas, pos_hook=None, neg_hook=None, noise_mask=None, e
         if not pos_dict and isinstance(pos_hook, dict):
             pos_dict = pos_hook
             
-        for key in ["reference_weight", "palette_mode", "ref_lat_style_type", "ref_lat_transfer_str", "ref_latent_features", "layernum", "layers"]:
+        # find all keys to _modify and _cnt
+        for key in ["reference_weight", "palette_mode", "ref_lat_style_type", "ref_lat_transfer_str", "ref_latent_features", 
+                    "spatial_features", "spatial_transfer_str", "spatial_weight", "spatial_guide_type", "layernum", "layers"]:
             if key in pos_dict:
                 latent_guide_options[key] = pos_dict[key]
 
@@ -1316,7 +1425,8 @@ def build_model_options(sigmas, pos_hook=None, neg_hook=None, noise_mask=None, e
                 print(f"\033[33m[Warning]\033[0m 네거티브 컨디셔닝에서도 라텐트 가이드가 감지되었습니다. 안전을 위해 포지티브 기준 가이드만 적용됩니다.")
             else:
                 print(f"\033[31m[Warning]\033[0m 포지티브가 아닌 네거티브에 라텐트 가이드가 연결되었습니다. 의도치 않은 결과가 나올 수 있습니다.")
-                for key in ["reference_weight", "palette_mode", "ref_lat_style_type", "ref_lat_transfer_str", "ref_latent_features", "layernum", "layers"]:
+                for key in ["reference_weight", "palette_mode", "ref_lat_style_type", "ref_lat_transfer_str", "ref_latent_features", 
+                            "spatial_features", "spatial_transfer_str", "spatial_weight", "spatial_guide_type", "layernum", "layers"]:
                     if key in neg_dict:
                         latent_guide_options[key] = neg_dict[key]
             
@@ -1351,16 +1461,91 @@ def build_model_options(sigmas, pos_hook=None, neg_hook=None, noise_mask=None, e
         
     return model_options
 
-def get_sigmas(model, scheduler, steps, denoise, device="cpu"):
+def get_sigmas(model, scheduler, steps, denoise, device="cpu", sigma_curve="Linear", weak_amplify=1.0):
 
     model_sampling = model.get_model_object("model_sampling")
-    
-    if denoise < 1.0:
-        new_steps = int(steps / denoise)
+    weak_amplify = max(1.0, min(2.0, weak_amplify))
+
+    if denoise <= 0.0:
+        sigmas = comfy.samplers.calculate_sigmas(model_sampling, scheduler, max(1, steps)).to(device)
+        return sigmas[:1]
+
+    effective_denoise = denoise
+    if sigma_curve == "Small Denoise Split":  # Reduce the Denoise sigma interposition
+        effective_denoise = denoise * 0.75
+        print(f"effective_denoise:{effective_denoise}")
+
+    if effective_denoise < 1.0:
+        new_steps = min(10000, int(steps / effective_denoise))
         sigmas = comfy.samplers.calculate_sigmas(model_sampling, scheduler, new_steps).to(device)
-        return sigmas[-(steps + 1):]
-    
-    sigmas = comfy.samplers.calculate_sigmas(model_sampling, scheduler, steps).to(device)
+        sigmas = sigmas[-(steps + 1):]
+    else:
+        sigmas = comfy.samplers.calculate_sigmas(model_sampling, scheduler, steps).to(device)
+
+    # ---------------------------------------------------------
+    # Sigma Curve
+    #
+    # Strong In : Strong early on → Weak later
+    # Weak In   : Weakness early on → followed by slight strength
+    # Strong Out: Weakness through mid-session → Slight strength in the latter half
+    # Weak Out  : Strong through mid-game → Weak in the late game
+    # ---------------------------------------------------------
+    n = len(sigmas)
+
+    def amplify_weak(weight_tensor):
+        # Amplify only the amount deviating from 1.0 (weakening amount)
+        return 1.0 - (1.0 - weight_tensor) * weak_amplify
+
+    if n > 3:
+
+        weights = torch.ones(n, device=device)
+
+        if sigma_curve == "Strong In":
+
+            split = max(1, int(n * 0.35))
+
+            # Strong start
+            weights[:split] = torch.linspace(1.00, 0.98, split, device=device)
+
+            # Weakness thereafter
+            weak_part = torch.linspace(0.98, 0.90, n - split, device=device)
+            weights[split:] = amplify_weak(weak_part)
+
+        elif sigma_curve == "Weak In":
+
+            split = max(1, int(n * 0.35))
+
+            # Weakness early on
+            weak_part = torch.linspace(0.95, 0.98, split, device=device)
+            weights[:split] = amplify_weak(weak_part)
+
+            # Slight strengthening thereafter
+            weights[split:] = torch.linspace(0.98, 1.00, n - split, device=device)
+
+        elif sigma_curve == "Strong Out":
+
+            split = max(1, int(n * 0.65))
+
+            # Weakness through mid-term
+            weak_part = torch.linspace(0.95, 0.98, split, device=device)
+            weights[:split] = amplify_weak(weak_part)
+
+            # Slight gain in the latter half
+            weights[split:] = torch.linspace(0.98, 1.00, n - split, device=device)
+
+        elif sigma_curve == "Weak Out":
+
+            split = max(1, int(n * 0.65))
+
+            # Strong through the middle
+            weights[:split] = torch.linspace(1.00, 0.98, split, device=device)
+
+            # Weakness in the second half
+            weak_part = torch.linspace(0.98, 0.95, n - split, device=device)
+            weights[split:] = amplify_weak(weak_part)
+
+        sigmas = sigmas * weights
+
     return sigmas
 
 def erode_mtensor(mask_tensor, kernel_size=5, sigma=2, iterations=1, tapered_corners=True):
@@ -1609,27 +1794,18 @@ class EasyProjectionLayer(IO.ComfyNode):
                 embedload.Input("EMBEDS", tooltip="임베딩 입력"),
                 ProjL.Input("projection_layer", tooltip="프로젝션 레이어 입력", optional=True),
                 IO.Clip.Input("clip_model", tooltip="컨디셔닝 처리용 클립 연결", optional=True),
-                IO.Int.Input("in_dim", default="768", tooltip="원본 임베딩의 dim값"),
-                IO.Int.Input("out_dim", default="768", tooltip="변경할 임베딩의 dim값"),
+                IO.Int.Input("in_dim", default="768", step=1, tooltip="원본 임베딩의 dim값"),
+                IO.Int.Input("out_dim", default="768", step=1, tooltip="변경할 임베딩의 dim값"),
                 IO.Combo.Input("clip_type",
                                options=["none", "stable_diffusion", "stable_cascade", "sd3", "stable_audio",
                                         "mochi", "ltxv", "pixart", "cosmos", "lumina2", "wan", "hidream",
                                         "chroma", "ace", "omnigen2", "qwen_image", "hunyuan_image",
                                         "flux2", "ovis"],
-                               default="none",
-                               tooltip="유형 정리"),
-                IO.Combo.Input("save_mode",
-                               options=["none","save"],
-                               default="none",
-                               tooltip="보정된 임베딩 레이어 정보를 파일로 저장할지 여부"),
-                IO.Combo.Input("output_settings",
-                               options=["conditioning","embedding output"],
-                               default="conditioning",
-                               tooltip="출력 방식"),
-                IO.Int.Input("cond_strength", default=10, min=1, max=12,
-                             tooltip="조건 강도 (1~12), 0.1~1.2로 처리됩니다."),
-                IO.Int.Input("neg_scale", default=1, min=1, max=50,
-                             tooltip="부정 조건 추가 약화 강도. 나누기로 처리되며, (1~50)까지 처리됩니다.\n"
+                               default="none", tooltip="유형 정리"),
+                IO.Combo.Input("save_mode", options=["none","save"], default="none", tooltip="보정된 임베딩 레이어 정보를 파일로 저장할지 여부"),
+                IO.Combo.Input("output_settings", options=["conditioning","embedding output"], default="conditioning", tooltip="출력 방식"),
+                IO.Int.Input("cond_strength", default=10, min=1, max=12, step=1, tooltip="조건 강도 (1~12), 0.1~1.2로 처리됩니다."),
+                IO.Int.Input("neg_scale", default=1, min=1, max=50, step=1, tooltip="부정 조건 추가 약화 강도. 나누기로 처리되며, (1~50)까지 처리됩니다.\n"
                              "네거티브 임베딩을 연결할 때 사용하세요. 기본값인 1로 두면 적용되지 않습니다."),
             ],
             outputs=[
@@ -1877,6 +2053,77 @@ class EasyClipTextEncodeSimple(IO.ComfyNode):
 
         elif output_settings == "embedding output":
             text = prompt_text if prompt_text is not None else ""
+            if text:
+                embeds = prompt_to_embedding(clip_model=clip, prompt_text=text, device="cpu")
+                em_tensor = embeds.float()
+                if emb_opt == "textsave":
+                    save_dir = os.path.join(folder_paths.base_path,"models","embeddings")
+                    os.makedirs(save_dir, exist_ok=True)
+                    filename = resolve_embfilename(file_name, save_dir)
+                    filepath = os.path.join(save_dir, filename)
+                    metadata = {"original_text": text, "embed_shape": str(list(em_tensor.shape))}
+                    try:
+                        save_file({"embedding": em_tensor}, filepath, metadata=metadata)
+                        print(f"{CYAN}{BOLD}[EasyClipTextEncodeSimple]{RESET} Save complete: {filepath}")
+                    except Exception as e:
+                        print(f"{CYAN}{BOLD}[EasyClipTextEncodeSimple]{RESET} Save failure: {e}")
+
+            return IO.NodeOutput(None)
+
+#----------------------------------------
+
+class EasyClipTextEncodeClamp(IO.ComfyNode):
+
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="EasyClipTextEncodeClamp",
+            display_name="CLIP 텍스트 인코더 (클램핑)",
+            category="커스텀임베딩/프롬프트",
+            description="긍정/부정 프롬프트만 처리하는 단순형 텍스트 인코더 노드.\n"
+                "강도 문법은 (keywords:weight factor)식으로 쓰시면 됩니다.\n"
+                "prompt_text는 음수를 무시합니다.\n"
+                "prompt_text_raw는 음수를 그대로 허용합니다.\n"
+                "텍스트 임베딩으로 저장하시려면 출력을 임베딩으로 옮기신 뒤 이름을 적고 emb_opt를 정하여 노드실행을 하시면 됩니다.\n"
+                "(텍스트임베딩 출력노드 겸용입니다. 실행버튼이 노드에 존재합니다.)",
+            inputs=[
+                IO.Clip.Input("clip", tooltip="컨디셔닝 처리용 클립 연결"),
+                IO.String.Input("prompt_text", multiline=True, tooltip="프롬프트 입력란"),
+                IO.String.Input("prompt_text_raw", multiline=True, tooltip="프롬프트 입력란(음수 가능)"),
+                IO.Combo.Input("output_settings", options=["conditioning", "embedding output"], default="conditioning", tooltip="출력설정"),
+                IO.String.Input("file_name", default="easyemb_%number", tooltip="파일명 지정"),
+                IO.Combo.Input("emb_opt", options=["basic", "textsave"], default="basic", tooltip="텍스트임베딩 프롬프트 기록 여부"),
+            ],
+            is_output_node=True,
+            outputs=[
+                IO.Conditioning.Output("conditioning", tooltip="조건 출력"),
+            ]
+        )
+
+    @classmethod
+    def execute(cls, clip, prompt_text=None, prompt_text_raw=None, output_settings="conditioning", file_name="easyemb_%number", emb_opt="basic") -> IO.NodeOutput:
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        process_cond = []
+        if prompt_text:
+            cond = normalize_and_encode(clip, prompt_text, 1.0, device)
+        elif prompt_text_raw:
+            cond = normalize_and_encode(clip, prompt_text_raw, 1.0, device, clamp=False)
+
+        # layer count
+        layer_count, layernames = get_layer_count(clip)
+            
+        if output_settings == "conditioning":
+            if layer_count > 0:
+                cond_final = []
+                cond_final.extend(node_helpers.conditioning_set_values(process_cond, {"layernum": layer_count, "layers": layernames}, append=False))
+            else:
+                cond_final = process_cond
+            return IO.NodeOutput(cond_final)
+
+        elif output_settings == "embedding output":
+            text = prompt_text or prompt_text_raw or ""
             if text:
                 embeds = prompt_to_embedding(clip_model=clip, prompt_text=text, device="cpu")
                 em_tensor = embeds.float()
@@ -3574,36 +3821,36 @@ class AutoMaskPrep_ADV(IO.ComfyNode):
 
         device = mask.device
     
-        # 1. 배치 및 채널 차원을 떼어내어 2차원 [H, W] numpy 배열로 변환
-        # (B, C, H, W) 또는 (1, 1, H, W) 구조에 유연하게 대응
+        # 1. Extract the batch and channel dimensions and convert to a 2D [H, W] numpy array
+        # Fluctuates flexibly between (B, C, H, W) and (1, 1, H, W) structures
         mask_np = mask.detach().cpu().squeeze().numpy()
     
         if mask_np.ndim != 2:
-            # 차원이 예상치 못하게 꼬인 경우를 대비한 안전 장치
+            # A safety mechanism for cases where dimensions are unexpectedly misaligned
             return mask
 
-        # 2. 커널 사이즈 계산 (sigma 값에 비례하여 홀수 크기로 자동 설정)
+        # 2. Kernel size calculation (automatically set to an odd size proportional to the sigma value)
         k_size = int(blur_sigma * 3) * 2 + 1
     
-        # 3. 가우시안 블러 적용 (경계를 부드러운 그라데이션으로 만듦)
+        # 3. Apply Gaussian Blur (make the edges smooth with a gradient)
         blurred = cv2.GaussianBlur(mask_np, (k_size, k_size), blur_sigma)
     
-        # 4. 외곽의 너무 퍼진 잔상을 잡아주기 위한 콘트라스트(Smoothstep) 보정
-        # 0.2 ~ 0.8 구간의 경사도를 가파르게 만들어 중심부는 진하게, 외곽은 부드럽게 유지
-        # (선택 사항이지만 이 과정을 거치면 뭉개짐 없이 칼같은 안티앨리어싱이 됨)
+        # 4. Contrast (Smoothstep) correction to tame overly washed-out outer edges
+        # Make the slope between 0.2 and 0.8 steep, keeping the center dense and the outer edges smooth
+        # (Optional, but this process results in razor-sharp anti-aliasing without blurring)
         min_val, max_val = blurred.min(), blurred.max()
         if max_val > min_val:
             normalized = (blurred - min_val) / (max_val - min_val)
-            # S자 커브(Smoothstep)로 경계면 대비 극대화
+            # Maximizes boundary contrast with S-curves (Smoothstep)
             smoothed = normalized * normalized * (3.0 - 2.0 * normalized)
             final_np = min_val + smoothed * (max_val - min_val)
         else:
             final_np = blurred
 
-        # 5. 다시 원래의 텐서 형태와 디바이스로 복구
+        # 5. Restore to the original tensor shape and device
         final_tensor = torch.from_numpy(final_np).float().to(device)
     
-        # 원래 가지고 있던 차원 구조로 복원 (예: [1, 1, H, W])
+        # Restore to the original dimension structure (e.g., [1, 1, H, W])
         while final_tensor.dim() < mask.dim():
             final_tensor = final_tensor.unsqueeze(0)
         
@@ -4071,7 +4318,7 @@ class EasyencoderChecker(IO.ComfyNode):
             description="CLIP 인코더의 타입과 차원을 텍스트로 시각화합니다.",
             inputs=[
                 IO.Combo.Input("clip_name", options=files, default=files[0] if files else "", tooltip="확인할 텍스트 인코더 파일"),
-                IO.Int.Input("font_size", default=14, min=8, max=48, tooltip="폰트 크기. 텍스트 리스트 모드일 때는 스킵됩니다."),
+                IO.Int.Input("font_size", default=14, min=8, max=48, step=1, tooltip="폰트 크기. 텍스트 리스트 모드일 때는 스킵됩니다."),
                 IO.Boolean.Input("show_preview", default=False, tooltip="노드 위젯으로 바로 보고 싶다면 켜세요."),
             ],
             hidden=[IO.Hidden.prompt, IO.Hidden.extra_pnginfo],
@@ -4247,7 +4494,7 @@ class EasyEmbeddingChecker(IO.ComfyNode):
             description="임베딩 파일 구조와 shape를 텍스트로 시각화합니다.",
             inputs=[
                 IO.Combo.Input("embedding_name", options=files, default=files[0] if files else "", tooltip="확인할 임베딩 파일"),
-                IO.Int.Input("font_size", default=32, min=20, max=48, tooltip="폰트 크기. 텍스트 리스트 모드일 때는 스킵됩니다."),
+                IO.Int.Input("font_size", default=32, min=20, max=48, step=1, tooltip="폰트 크기. 텍스트 리스트 모드일 때는 스킵됩니다."),
                 IO.Boolean.Input("show_preview", default=False, tooltip="노드 위젯으로 바로 보고 싶다면 켜세요."),
             ],
             hidden=[IO.Hidden.prompt, IO.Hidden.extra_pnginfo],
@@ -4340,7 +4587,7 @@ class EasyProjLayerChecker(IO.ComfyNode):
             description="프로젝션 레이어 파일의 차원/메타데이터를 확인하고 오류 여부를 시각화합니다.",
             inputs=[
                 IO.Combo.Input("proj_file", options=files, default=files[0] if files else "", tooltip="확인할 프로젝션 레이어 파일"),
-                IO.Int.Input("font_size", default=14, min=8, max=48, tooltip="미리보기용 폰트 크기"),
+                IO.Int.Input("font_size", default=14, min=8, max=48, step=1, tooltip="미리보기용 폰트 크기"),
                 IO.Boolean.Input("show_preview", default=True, tooltip="노드 위젯으로 띄울지 여부"),
             ],
             hidden=[IO.Hidden.prompt, IO.Hidden.extra_pnginfo],
@@ -4449,11 +4696,12 @@ class EasySampler(IO.ComfyNode):
                         "CPU 모드에서도 충돌을 최소화하며 latent를 초기화하고 샘플링을 수행합니다.\n"
                         "라데온 계열도 돌아가긴 하지만, ROCm 처리 조건이 부족하면 CPU모드로 기동될 수 있습니다.\n"
                         "사용된 시드 값은 CMD에 프린트 로그로 남아있습니다. 시드를 고정하려면 복사해서 붙여넣으면 됩니다.\n"
-                        "[참고] 베이스 온리(Base Only) 모드에서는 시드가 고정되어 있어도 연산 특성상 결과물이 미세하게 달라질 수 있습니다.",
+                        "시그마 값을 연결한 경우 스텝/디노이즈/스케줄러는 봉인됩니다. 참고하세요.",
             inputs=[
                 IO.Model.Input("model", tooltip="사용할 모델"),
                 IO.Boolean.Input("disable_noise", default=False, tooltip="노이즈 적용여부 확인"),
                 IO.String.Input("seedset", default=0, tooltip="노이즈 시드.0이면 랜덤 시드를 넣고, 시드넘버를 넣은 경우 고정시드로 취급됩니다."),
+                IO.Sigmas.Input("sigmas", tooltip="사용할 시그마 정보. 입력 안할 시 기본 스케줄러/디노이즈로 자동 계산됩니다.", optional=True),
                 IO.Int.Input("steps", default=20, min=1, max=10000, step=1, tooltip="스텝 수. 수텝수가 많아질수록 추가작업이 들어가지만,"
                              "너무 많은 경우 품질이 떨어질 수 있습니다."),
                 IO.Float.Input("cfg", default=8.0, min=0.0, max=100.0, step=0.1, tooltip="CFG 스케일. 높아질수록 텍스트 처리 강도가 오르지만,\n"
@@ -4469,8 +4717,6 @@ class EasySampler(IO.ComfyNode):
                              " 정상적으로 라텐트가 들어올 땐 작동하지 않습니다."),
                 IO.Combo.Input("mode",
                                options=["cpu","nvidia","amd"], default="cpu", tooltip="실행 장치"),
-                IO.Int.Input("start_at_step", default=0, min=0, max=10000, tooltip="스텝 시작점"),
-                IO.Int.Input("end_at_step", default=10000, min=0, max=10000, tooltip="스텝 종점"),
                 IO.Combo.Input("return_with_leftover_noise", options=["disable", "enable"], default="disable", tooltip="노이즈 반환 처리"),
                 IO.Float.Input("denoise", default=1.00, min=0.00, max=1.00, step=0.01, tooltip="디노이즈 강도"),
                 IO.Boolean.Input("normalize_noise", tooltip="xl계열에서 노이즈 번 에러 발생시 활용가능한 노이즈 안정화", default=False),
@@ -4482,10 +4728,8 @@ class EasySampler(IO.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, latent, disable_noise, seedset=0, positive=None, negative=None,
-                steps=20, cfg=8.0, sampler_name="euler", scheduler="simple",
-                height=512, width=512, mode="cpu", start_at_step=0, end_at_step=10000,
-                return_with_leftover_noise="disable", denoise=1.00, normalize_noise=False, clear_cache=False) -> IO.NodeOutput:
+    def execute(cls, model, latent, disable_noise, seedset=0, sigmas=None, steps=20, cfg=8.0, sampler_name="euler", scheduler="simple",
+                positive=None, negative=None, height=512, width=512, mode="cpu", return_with_leftover_noise="disable", denoise=1.00, normalize_noise=False, clear_cache=False) -> IO.NodeOutput:
 
         # set device
         if mode == "cpu":
@@ -4520,6 +4764,8 @@ class EasySampler(IO.ComfyNode):
         positive = get_safe_conditioning(positive, device, model, cfg)
 
         negative = get_safe_conditioning(negative, device, model, cfg)
+
+        sampler = comfy.samplers.sampler_object(sampler_name)
 
         seed_val = parse_seed(seedset)
         if seed_val == 0:
@@ -4576,21 +4822,26 @@ class EasySampler(IO.ComfyNode):
         disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
         force_full_denoise = (return_with_leftover_noise == "disable")
 
-        model_options = {}
+
+        if sigmas is not None:
+            use_sigmas = sigmas.to(device)
+            actual_steps = len(use_sigmas) - 1
+        else:
+            use_sigmas = get_sigmas(model, scheduler, steps, denoise, device)
+            actual_steps = steps
 
 
+        extra = None
+        if latent_image.ndim == 5:
+            extra = {"is_flow": (latent_image.ndim == 5)}
+
+        model_options = {"transformer_options": extra or {}}
         comfy.samplers.cast_to_load_options(model_options, device=device, dtype=latent_image.dtype)
 
+        callback = latent_preview.prepare_callback(model, actual_steps)
+        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
-        samples = comfy.sample.sample(
-            model, noise, steps, cfg, sampler_name, scheduler,
-            positive, negative, latent_image,
-            denoise=denoise, disable_noise=disable_noise,
-            start_step=start_at_step, last_step=end_at_step,
-            force_full_denoise=force_full_denoise, noise_mask=noise_mask,
-            callback=callback, disable_pbar=disable_pbar, seed=base_seed
-        )
-
+        samples = comfy.sample.sample_custom(model, noise, cfg, sampler, use_sigmas, positive, negative, latent_image, noise_mask=noise_mask, callback=callback, disable_pbar=disable_pbar, seed=base_seed)
 
         l_prev = latent.copy()
         l_prev.pop("downscale_ratio_spacial", None)
@@ -4605,39 +4856,40 @@ class EasySampler(IO.ComfyNode):
         return IO.NodeOutput(out, )
 
 #----------------------------------------
+
+
 class EasySigmaCalculator(IO.ComfyNode):
 
     @classmethod
-    def  define_schema(cls):
+    def define_schema(cls):
         return IO.Schema(
             node_id="EasySigmaCalculator",
             display_name="시그마 준비기",
             category="커스텀임베딩/샘플링",
-            description="(시험중)모델별 시그마를 선택해 준비하고 출력합니다. 이지 샘플러의 경우 full context를 켜면 여기서 입력한걸 이을 수 있습니다.",
+            description="시그마 곡선과 디노이즈 영향을 조절해 샘플링용 시그마를 준비합니다.",
             inputs=[
-                IO.Model.Input("model", tooltip="사용할 모델", optional=True),
-                IO.Combo.Input("model_type", options=["Auto", "ModelSamplingDiscrete", "ModelSamplingDiscreteEDM", "ModelSamplingContinuousEDM", "ModelSamplingContinuousV", 
-                               "ModelSamplingDiscreteFlow", "StableCascadeSampling", "ModelSamplingFlux", "ModelSamplingCosmosRFlow"], 
-                               default="Auto", tooltip="시그마 준비 모드. auto일 때는 모델연결이 필수이며, 다른 모드일때는모드별 시그마로 준비합니다."),
-                IO.Int.Input("steps", default=20, min=1, max=10000, tooltip="스텝 수. 수텝수가 많아질수록 추가작업이 들어가지만, 너무 많은 경우 품질이 떨어질 수 있습니다."),
+                IO.Model.Input("model", tooltip="사용할 모델 (필수)"),
+                IO.Int.Input("steps", default=20, min=3, max=200, step=1, tooltip="스텝 수(최소 3, 최대 200)"),
                 IO.Combo.Input("scheduler", options=comfy.samplers.KSampler.SCHEDULERS, default="simple", tooltip="스케줄러"),
-                IO.Float.Input("denoise", default=1.00, min=0.00, max=1.00, step=0.01, tooltip="디노이즈 강도"),
-                IO.Boolean.Input("full_context", default=False, tooltip="스위치를 켤 시 시그마와 스텝, 디노이즈를 다음 노드에 전달합니다. 인풋정보가 같다면 샘플러에도 전달할 수 있습니다.\n"
-                                 "False일때는 시그마 외의 출력이 연결될 시 오류가 날 수 있습니다"),
+                IO.Float.Input("denoise", default=1.000, min=0.000, max=1.000, step=0.001, tooltip="디노이즈 강도"),
+                IO.Combo.Input("sigma_curve", options=["Linear", "Strong In", "Strong Out", "Weak In", "Weak Out", "Small Denoise Split"], default="Linear", tooltip="시그마 곡선 및 디노이즈 간섭 제어 방식\n"
+                               "(linear:디폴트,strong in:초반이후 약화, strong out:중반까지 약세-이후 정상화, weak in:초반만 약화-이후 정상화, weak out:후반약화, small denoise split:디노이즈의 시그마 영향 감소)"),
                 IO.Combo.Input("mode", options=["cpu","nvidia","amd"], default="cpu", tooltip="실행 장치"),
             ],
             outputs=[
-                IO.Sigmas.Output("sigmas", tooltip="간이 시그마 전달"),
-                IO.Int.Output("steps", tooltip="전달할 스텝 수"),
-                IO.Combo.Output("scheduler", tooltip="전달할 스케줄러 세팅"),
-                IO.Float.Output("denoise", tooltip="전달할 디노이즈 강도")
+                IO.Model.Output("model", tooltip="전달된 모델"),
+                IO.Sigmas.Output("sigmas", tooltip="계산된 시그마"),
+                IO.Int.Output("steps", tooltip="스텝 수"),
+                IO.Combo.Output("scheduler", tooltip="스케줄러"),
+                IO.Combo.Output("mode", tooltip="실행장치"),
+                IO.Float.Output("denoise", tooltip="디노이즈 강도")
             ],
         )
 
     @classmethod
+    def execute(self, model, steps=20, scheduler="simple", denoise=1.000, sigma_curve="Linear", mode="cpu"):
 
-    def execute(self, model=None, model_type="Auto", steps=20, scheduler="simple", denoise=1.00, full_context=False, mode="cpu"):
-
+        steps = min(200, max(int(steps),3))
         # set device
         if mode == "cpu":
             device = "cpu"
@@ -4653,24 +4905,9 @@ class EasySigmaCalculator(IO.ComfyNode):
             else:
                 device = "cpu" 
 
-        if model is not None:
-            base_sigmas = get_sigmas(model, scheduler, steps, denoise, device)
-            if model_type == "Auto":
-                model_typename = model.model.model_sampling
-            else:
-                model_typename = sampler_edit.get_sampling_by_type(model_type)
-        else:
-            base_sigmas = sampler_edit.get_sigma_factory(steps, denoise, scheduler, device)
-            model_typename = sampler_edit.get_sampling_by_type(model_type)
+        sigmas = get_sigmas(model, scheduler, steps, denoise, device, sigma_curve=sigma_curve)
 
-        params = sampler_edit.update_params_from_sigmas(base_sigmas, model_type)
-
-
-        sigmas = sampler_edit.calculate_sigmas_by_sampling(model_type, steps, denoise, scheduler, device, params)
-        if full_context:
-            return (sigmas, steps, scheduler, denoise) 
-        else:
-            return (sigmas, None, None, None)
+        return (model, sigmas, steps, scheduler, mode, denoise)
 
 #----------------------------------------
 
@@ -5062,7 +5299,8 @@ class MaskPrepResizer(IO.ComfyNode):
             node_id="MaskPrepResizer",
             display_name="마스크 벡터 리사이징 준비기",
             category="커스텀임베딩/샘플링",
-            description="벡터 리사이징과 페더링을 활용하여 일반 이미지 해상도 기준으로 마스크를 정밀 가공합니다.",
+            description="벡터 리사이징과 페더링을 활용하여 일반 이미지 해상도 기준으로 마스크를 정밀 가공합니다.\n"
+                        "사이즈가 256X256 이하로 내려갈 경우는 use Vector를 끄는게 좋습니다.",
             inputs=[
                 IO.Mask.Input("mask", tooltip="입력 마스크"),
                 IO.Combo.Input("mask_mode", options=["dilate", "dilate_feather", "default", "light_feather", "feather", "hard_feather"], default="default", tooltip="마스크 처리 모드"),
@@ -5523,14 +5761,15 @@ class EasyInpaintAndConditioning_modify(IO.ComfyNode):
         start_percent = max(0.0, min(0.9, start_percent))
         end_percent = max(start_percent, min(1.0, end_percent))
 
+        
         if pixels.dim() == 4:
-            if pixels.shape[-1] == 3:  # [B, H, W, C]
-                b, h, w, c = pixels.shape
-            else:  # [B, C, H, W]
+            if pixels.shape[1] <= 4 and pixels.shape[3] > 4:  # [B, C, H, W]
                 b, c, h, w = pixels.shape
                 pixels = pixels.permute(0, 2, 3, 1) # [B, H, W, C]
+            else:   # [B, H, W, C]
+                b, h, w, c = pixels.shape
         else:
-            b, h, w, c = pixels.shape
+            b, h, w, c = pixels.shape # [B, H, W, C]
 
         downscale_ratio = 8
         target_w = (w // downscale_ratio) * downscale_ratio
@@ -5686,6 +5925,280 @@ class EasyInpaintAndConditioning_modify(IO.ComfyNode):
 #----------------------------------------
 
 
+class EasyInpaintAndConditioning_cnt(IO.ComfyNode):
+
+    # Test node. Some code is missing, so it cannot be used immediately.
+    @classmethod
+    def ensure_image_tensor(cls, arr):
+        if not isinstance(arr, torch.Tensor):
+            arr = torch.from_numpy(np.array(arr)).float()
+
+        if arr.dim() == 2:
+            arr = arr.unsqueeze(0).unsqueeze(-1)
+        elif arr.dim() == 3:
+            arr = arr.unsqueeze(0)
+        elif arr.dim() == 4:
+            pass
+        else:
+            raise ValueError(f"Unsupported image shape: {arr.shape}")
+
+        if arr.shape[1] <= 4 and arr.shape[3] > 4:
+            arr = arr.permute(0, 2, 3, 1)
+            
+        return arr.float()
+
+    @classmethod
+    def sanitize_input_mask(cls, mask):
+        if mask is None:
+            return None
+
+        if isinstance(mask, dict):
+            if "latent_mask" in mask:
+                mask = mask["latent_mask"]
+            elif "noise_mask" in mask:
+                mask = mask["noise_mask"]
+            elif "mask" in mask:
+                mask = mask["mask"]
+            elif "samples" in mask:
+                mask = mask["samples"]
+
+        if hasattr(mask, "dtype") and mask.dtype == torch.bool:
+            mask = mask.float()
+        if mask.ndim == 5:
+            return mask
+        return ensure_mask_tensor(mask)
+
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="EasyInpaintAndConditioning_cnt",
+            display_name="간단 인페인트 및 컨디셔닝(스페이셜 가이드)",
+            category="커스텀임베딩/샘플링",
+            description=(
+                "이미지와 마스크, 그리고 공간 가이드(OpenPose/Canny/Depth/Lineart)를 기반으로 "
+                "구조가 보존되는 인페인팅용 컨디셔닝과 노이즈 마스크를 생성합니다.\n"
+                "원본을 토대로 뽑힌 희소 데이터(스켈레톤, 엣지) 입력 시 발생하는 텐서 충돌을 방지합니다."
+                "스페이셜 가이드 슬롯에는 일반 사진이나 컬러 이미지를 넣으면 의도한 대로 동작하지 않습니다. 반드시 DWPose(뼈대), Canny(외곽선), Depth(깊이맵) 전용 이미지를 연결해 주세요."
+            ),
+            inputs=[
+                IO.Conditioning.Input("positive", tooltip="긍정 프롬프트 컨디셔닝"),
+                IO.Conditioning.Input("negative", tooltip="부정 프롬프트 컨디셔닝"),
+                IO.Image.Input("pixels", tooltip="인페인팅 대상 원본 이미지 텐서"),
+                IO.Vae.Input("vae", tooltip="이미지 인코딩에 사용할 VAE 객체"),
+                IO.Mask.Input("mask", optional=True, tooltip="인페인팅 영역 마스크. 연결 안할 시 전체 기준이 됩니다."),
+                IO.Combo.Input("mask_resize_mode", options=["nearest", "bilinear", "bicubic", "lanczos", "pixelbox"], default="pixelbox", tooltip="리사이즈 보간 모드"),
+                IO.Int.Input("grow_mask_by", default=2, min=0, max=64, step=1, tooltip="마스크 경계 확장 크기"),
+                IO.Boolean.Input("noise_mask", default=True, tooltip="마스크 영역 내부로 노이즈 제한"),
+                IO.Image.Input("spatial_guide", tooltip="공간 구조 가이드 이미지 (OpenPose, Canny, Depth, Lineart 등)", optional=True),
+                IO.Combo.Input("guide_type", options=["OpenPose", "Canny", "Depth", "Lineart"], default="OpenPose", tooltip="입력된 가이드 이미지의 해석 유형"),
+                IO.Combo.Input("guide_str", options=["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20"], default="5", tooltip="가이드 적용 강도 (0~20)"),
+                IO.Float.Input("guide_activation_value", default=1.0, min=0.0, max=1.0, step=0.1, tooltip="가이드 훅 영향력 가중치"),
+                IO.String.Input("pose_coords_str", default="", tooltip="오픈 포즈용 좌표 코드. 오픈포즈일 때만 받습니다.", optional=True),
+                IO.Boolean.Input("clear_cache", default=False, tooltip="노드 시작시 캐시 정리"),
+                IO.Boolean.Input("preview_mode", default=False, tooltip="가이드 블렌딩 예시 이미지 출력"),
+                IO.Combo.Input("inpaint_blend_mode", options=["Inpaint_Model", "Static_Edge", "Faint_Edge", "Blank_Solid"], default="Static_Edge", tooltip="인페인팅 전처리 블렌딩 모드 선택"),
+                IO.Float.Input("start_percent", default=0.0, min=0.0, max=1.0, step=0.05, tooltip="가이드 작동 시작 타임스텝"),
+                IO.Float.Input("end_percent", default=1.0, min=0.0, max=1.0, step=0.05, tooltip="가이드 작동 종료 타임스텝"),
+            ],
+            hidden=[IO.Hidden.prompt, IO.Hidden.extra_pnginfo],
+            is_output_node=True,
+            outputs=[
+                IO.Conditioning.Output("positive", tooltip="스페이셜 가이드가 바인딩된 긍정 컨디셔닝"),
+                IO.Conditioning.Output("negative", tooltip="스페이셜 가이드가 바인딩된 부정 컨디셔닝"),
+                IO.Latent.Output("latent", tooltip="노이즈 마스크가 포함된 인페인팅 베이스 라텐트"),
+                IO.Latent.Output("concat_latent", tooltip="가이드 처리된 확인용 라텐트"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, positive, negative, pixels, vae, mask=None, mask_resize_mode="pixelbox", grow_mask_by=2, noise_mask=True, 
+                spatial_guide=None, guide_type="OpenPose", guide_str="5", guide_activation_value=1.0, pose_coords_str="",
+                clear_cache=False, preview_mode=False, inpaint_blend_mode="Static_Edge", start_percent=0.0, end_percent=1.0) -> IO.NodeOutput:
+
+        if clear_cache:
+            current_device = model_management.get_torch_device()
+            if current_device.type == "cuda":
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            gc.collect()
+
+        start_percent = max(0.0, min(0.9, start_percent))
+        end_percent = max(start_percent, min(1.0, end_percent))
+        
+        if pixels.dim() == 4:
+            if pixels.dim() == 4 and pixels.shape[1] <= 4 and pixels.shape[3] > 4:  # [B, C, H, W]
+                b, c, h, w = pixels.shape
+                pixels = pixels.permute(0, 2, 3, 1) # [B, H, W, C]
+            else:   # [B, H, W, C]
+                b, h, w, c = pixels.shape
+        else:
+            b, h, w, c = pixels.shape # [B, H, W, C]
+
+        downscale_ratio = 8
+        target_w = (w // downscale_ratio) * downscale_ratio
+        target_h = (h // downscale_ratio) * downscale_ratio
+
+        mask_tensor = cls.sanitize_input_mask(mask)
+        if mask_tensor is None:
+            mask_tensor = torch.ones((b, 1, h, w), device=pixels.device, dtype=torch.float32)
+        else:
+            masknp_2d = mask_tensor.squeeze().cpu().numpy().astype(np.uint8) * 255
+            resized_mask_np = vector_resize_mask(masknp_2d, w, h, resize_mode=mask_resize_mode)
+            mask_tensor = torch.from_numpy(resized_mask_np).to(pixels.device)
+            mask_tensor = ensure_mask_tensor(mask_tensor)
+
+        if w != target_w or h != target_h:
+            x_offset = (w % downscale_ratio) // 2
+            y_offset = (h % downscale_ratio) // 2
+            pixels = pixels[:, y_offset:target_h + y_offset, x_offset:target_w + x_offset, :]
+            mask_tensor = mask_tensor[:, :, y_offset:target_h + y_offset, x_offset:target_w + x_offset]
+
+        orig_pixels = pixels.clone()
+        p_h, p_w = pixels.shape[1], pixels.shape[2]
+
+        if grow_mask_by == 0:
+            mask_erosion = torch.clamp(ensure_mask_tensor(mask_tensor), 0.0, 1.0)
+        else:
+            mask_tensor = ensure_mask_tensor(mask_tensor) 
+            kernel_tensor = torch.ones((1, 1, grow_mask_by, grow_mask_by), device=mask_tensor.device)
+            padding = math.ceil((grow_mask_by - 1) / 2)
+            mask_erosion = torch.clamp(F.conv2d(mask_tensor.round(), kernel_tensor, padding=padding), 0, 1)
+
+        if mask_erosion.shape[-2] > p_h or mask_erosion.shape[-1] > p_w:
+            mask_erosion = mask_erosion[:, :, :p_h, :p_w]
+
+        mask_erosion = torch.clamp(mask_erosion, 0.0, 1.0)
+        m4d = mask_erosion.permute(0, 2, 3, 1)
+
+        orig_latent = vae.encode(orig_pixels)
+        concat_pixels = pixels.clone()
+        concat_latent = None
+        guide_latent = None
+        spatial_features = {}
+        
+        t_str_val = int(guide_str) / 20.0
+        conditioning_data = {}
+
+        # --- Spatial Guide (OpenPose/Canny/Depth/LineArt) Safety Processing Logic ---
+        if spatial_guide is not None and t_str_val > 0.0:
+            guide_pixels = cls.ensure_image_tensor(spatial_guide)
+            if guide_pixels.shape[-1] == 3 or guide_pixels.shape[-1] == 1:
+                guide_pixels = F.interpolate(
+                    guide_pixels.permute(0, 3, 1, 2), 
+                    size=(p_h, p_w), 
+                    mode="bilinear", 
+                    align_corners=False
+                ).permute(0, 2, 3, 1)
+
+            # Structure the space tensor itself to prevent passing errors
+            guide_latent = vae.encode(guide_pixels)
+            lat_samples = guide_latent.get("samples", guide_latent) if isinstance(guide_latent, dict) else guide_latent
+            
+            if lat_samples is not None:
+                lat_samples = lat_samples.to(pixels.device)
+
+            # Space Guide Exclusive Feature Map Container Configuration
+            spatial_features = {
+                "guide_tensor": guide_pixels,
+                "lat_features": lat_samples,
+                "guide_type": guide_type
+            }
+            parsed_pose_data = None
+            if guide_type == "OpenPose" and pose_coords_str:
+                try:
+                    matches = re.findall(r"([A-Za-z0-9_]+)\{([0-9\.]+),([0-9\.]+)\}", pose_coords_str)
+                    if matches:
+                        parsed_pose_data = {name: (float(x), float(y)) for name, x, y in matches}
+                        print(f"[EasyInpaintAndConditioning] Successfully parsed OpenPose coordinates data: {len(parsed_pose_data)} joints")
+                    else:
+                        print(f"[EasyInpaintAndConditioning] pose_coords_str format not recognized.")
+                except Exception as e:
+                    print(f"[EasyInpaintAndConditioning] Failed to parse pose_coords_str: {e}")
+
+                spatial_features.update({"pose_coords": parsed_pose_data})
+                conditioning_data.update({"pose_coords_str": pose_coords_str})
+
+            conditioning_data.update({
+                "spatial_features": spatial_features,
+                "spatial_transfer_str": t_str_val,
+                "spatial_guide_type": guide_type,
+                "spatial_weight": guide_activation_value,
+            })
+
+        else:
+            print("No spatial guide, or the intensity is 0. It operates in default inpaint mode.")
+
+        # --- Blend mode processing ---
+        if "Inpaint_Model" in inpaint_blend_mode:
+            m3d = m4d.squeeze(-1)
+            m = (1.0 - m3d.round())
+            for i in range(min(3, concat_pixels.shape[-1])):
+                concat_pixels[:,:,:,i] -= 0.5
+                concat_pixels[:,:,:,i] *= m
+                concat_pixels[:,:,:,i] += 0.5
+
+        elif "Static_Edge" in inpaint_blend_mode:
+            m = (1.0 - m4d.round())
+            muted_pixels = concat_pixels * 0.5 + 0.25
+            concat_pixels = concat_pixels * m + muted_pixels * (1.0 - m)
+
+        elif "Faint_Edge" in inpaint_blend_mode:
+            m = (1.0 - m4d.round())
+            faint_pixels = concat_pixels * 0.2 + 0.5 * 0.8
+            concat_pixels = concat_pixels * m + faint_pixels * (1.0 - m)
+
+        elif "Blank_Solid" in inpaint_blend_mode:
+            m = (1.0 - m4d.round())
+            solid_gray = torch.full_like(concat_pixels, 0.5)
+            concat_pixels = concat_pixels * m + solid_gray * (1.0 - m)
+
+
+        if concat_latent is None:
+            concat_latent = vae.encode(concat_pixels)
+
+        out_latent = {"samples": orig_latent}
+        blend_latent = {"samples": concat_latent}
+
+        if noise_mask:
+            lat_h, lat_w = orig_latent.shape[-2], orig_latent.shape[-1]
+            target_mask = F.interpolate(mask_erosion.float(), size=(lat_h, lat_w), mode="nearest")
+            out_latent["noise_mask"] = target_mask.round().float()
+
+        if mask is not None:
+            conditioning_data.update({"reference_latents": concat_latent, "concat_mask": mask_erosion})
+        else:
+            conditioning_data.update({"reference_latents": concat_latent})
+
+        out_positive = sampler_edit.editcond_set_values_with_timestep_range(positive, conditioning_data, start_percent=start_percent, end_percent=end_percent)
+        out_negative = sampler_edit.editcond_set_values_with_timestep_range(negative, conditioning_data, start_percent=start_percent, end_percent=end_percent)
+
+        if preview_mode:
+            if spatial_guide is not None and t_str_val > 0.0 and 'guide_pixels' in locals():
+                # Visual blend with a 60% background (inpaint) and 40% guide skeleton ratio (weights adjustable as needed)
+                # Usually, Canny or OpenPose use a white line on a black background, so overlaying with additive (maximum or simple) blending works well.
+                guide_p = cls.ensure_image_tensor(guide_pixels)
+                # When in open pose, the lines are too thin and get smudged, so dilate them to make them slightly thicker
+                if guide_type == "OpenPose":
+                    guide_mask = (guide_p.sum(dim=-1, keepdim=True) > 0.01).float()
+                    thick_mask = F.max_pool2d(
+                        guide_mask.permute(0, 3, 1, 2), 
+                        kernel_size=3, stride=1, padding=1
+                    ).permute(0, 2, 3, 1)
+                    # Push the guide as strongly as the thickened mask area
+                    preview_pixels = concat_pixels * (1.0 - thick_mask) + torch.max(concat_pixels, guide_p * 1.5) * thick_mask
+                else:
+                    preview_pixels = torch.max(concat_pixels, guide_p * guide_activation_value)
+
+                preview_pixels = torch.clamp(preview_pixels, 0.0, 1.0)
+            else:
+                preview_pixels = concat_pixels
+            return IO.NodeOutput(out_positive, out_negative, out_latent, blend_latent, ui=UI.PreviewImage(preview_pixels))
+        return IO.NodeOutput(out_positive, out_negative, out_latent, blend_latent)
+
+#----------------------------------------
+
 class EasySamplerHook(IO.ComfyNode):
 
     @classmethod
@@ -5719,20 +6232,21 @@ class EasySamplerHook(IO.ComfyNode):
                         "사용된 시드 값은 CMD에 프린트 로그로 남아있습니다. 시드를 고정하려면 복사해서 붙여넣으면 됩니다.\n"
                         "Quen 계열에도 사용은 가능합니다.\n"
                         "절대 여러장을 동시처리하지 마세요. 샘플러가 터집니다.\n"
-                        "[참고] 베이스 온리(Base Only) 모드에서는 시드가 고정되어 있어도 연산 특성상 결과물이 미세하게 달라질 수 있습니다.",
+                        "[참고] 베이스 더블(base_double) 모드에서는 시드가 고정되어 있어도 연산 특성상 결과물이 미세하게 달라질 수 있습니다.",
             inputs=[
                 IO.Model.Input("model", tooltip="사용할 모델"),
                 IO.Boolean.Input("disable_noise", default=False, tooltip="노이즈 적용여부 확인"),
                 IO.Combo.Input("noise_mode", options=["default", "base_double"], default="default",
                                 tooltip="노이즈 적용 방식. 노이즈 스타일을 선택지에 따라 다르게 처리합니다. 베이스 더블 사용 시 normalize_noise를 none으로 두시면 안 됩니다."),
                 IO.String.Input("seedset", default=0, tooltip="노이즈 시드.0이면 랜덤 시드를 넣고, 시드넘버를 넣은 경우 고정시드로 취급됩니다."),
-                IO.Sigmas.Input("sigmas", tooltip="사용할 시그마 정보. 입력 안할 시 디폴트로 돌아갑니다.", optional=True),
                 IO.Int.Input("steps", default=20, min=1, max=10000, step=1, tooltip="스텝 수. 수텝수가 많아질수록 추가작업이 들어가지만,"
                                 "너무 많은 경우 품질이 떨어질 수 있습니다."),
                 IO.Float.Input("cfg", default=8.0, min=0.0, max=100.0, step=0.1, tooltip="CFG 스케일. 높아질수록 텍스트 처리 강도가 오르지만,\n"
                                    "과하면 품질이 떨어지거나 왜곡될 수 있습니다."),
                 IO.Combo.Input("sampler_name", options=comfy.samplers.KSampler.SAMPLERS, default="euler", tooltip="샘플러 알고리즘"),
                 IO.Combo.Input("scheduler", options=comfy.samplers.KSampler.SCHEDULERS, default="simple", tooltip="스케줄러"),
+                IO.Combo.Input("sigma_curve", options=["Linear", "Strong In", "Strong Out", "Weak In", "Weak Out", "Small Denoise Split"], default="Linear", tooltip="시그마 곡선 및 디노이즈 간섭 제어 방식\n"
+                                "(linear:디폴트, strong in:초반이후 약화, strong out:중반까지 약세-이후 정상화, weak in:초반만 약화-이후 정상화, weak out:후반약화, small denoise split:디노이즈의 시그마 영향 감소)"),
                 IO.Conditioning.Input("positive", tooltip="포지티브 컨디셔닝"),
                 IO.Conditioning.Input("negative", tooltip="네거티브 컨디셔닝"),
                 IO.Latent.Input("latent", tooltip="입력 latent. 빈 라텐트 이미지를 넣거나, 인코딩 또는 불러온 라텐트를 연결할 수 있습니다."),
@@ -5752,8 +6266,8 @@ class EasySamplerHook(IO.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, disable_noise, latent, noise_mode="default", seedset=0, positive=None, negative=None, sigmas=None, steps=20, cfg=8.0, sampler_name="euler",
-                scheduler="simple", height=512, width=512, mode="cpu", denoise=1.000, normalize_noise="none", get_shrinkmask=True, clear_cache=False) -> IO.NodeOutput:
+    def execute(cls, model, disable_noise, latent, noise_mode="default", seedset=0, positive=None, negative=None, steps=20, cfg=8.0, sampler_name="euler",
+                scheduler="simple", sigma_curve="Linear", height=512, width=512, mode="cpu", denoise=1.000, normalize_noise="none", get_shrinkmask=True, clear_cache=False) -> IO.NodeOutput:
 
         cls.show_data_preparation_progress("start")
 
@@ -5869,7 +6383,10 @@ class EasySamplerHook(IO.ComfyNode):
 
         cls.show_data_preparation_progress("noise set")
 
-        batch_inds = latent.get("batch_index", None)
+        if isinstance(latent, dict):
+            batch_inds = latent.get("batch_index", None)
+        else:
+            batch_inds = None
 
         if disable_noise:
             noise = torch.zeros_like(latent_image, device=device)
@@ -5896,10 +6413,7 @@ class EasySamplerHook(IO.ComfyNode):
             latent_image = latent_image[:1]
         cls.show_data_preparation_progress("waiting")
 
-        if sigmas is not None:
-            use_sigmas = sigmas.to(device)
-        else:
-            use_sigmas = get_sigmas(model, scheduler, steps, denoise, device)
+        use_sigmas = get_sigmas(model, scheduler, steps, denoise, device, sigma_curve=sigma_curve)
 
         extra = None
         if latent_image.ndim == 5:
@@ -5917,8 +6431,7 @@ class EasySamplerHook(IO.ComfyNode):
         callback = latent_preview.prepare_callback(model, steps)
         disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
-        samples = sampler_edit.sample_custom_edit(model, noise, cfg, sampler, use_sigmas, positive, negative, latent_image, noise_mask=noise_mask, callback=callback, disable_pbar=disable_pbar, seed=base_seed)
-
+        samples = sampler_edit.sample_custom_edit(model, noise, cfg, sampler, use_sigmas, positive, negative, latent_image, noise_mask=noise_mask, callback=callback, disable_pbar=disable_pbar, seed=base_seed, extra_model_options=model_options)
 
         l_prev = latent.copy()
         l_prev.pop("downscale_ratio_spacial", None)
@@ -5933,15 +6446,8 @@ class EasySamplerHook(IO.ComfyNode):
 
 
 #----------------------------------------
+
 class EasySamplerADV(IO.ComfyNode):
-
-    @classmethod
-    def apply_denoise_mask(cls, latent_image, mask):
-        # mask size match
-        if mask.shape[-1] != latent_image.shape[-1] or mask.shape[-2] != latent_image.shape[-2]:
-            mask = F.interpolate(mask.float(), size=latent_image.shape[-2:], mode="nearest")
-
-        return mask
 
     @classmethod
     def show_data_preparation_progress(cls, stage):
@@ -5954,34 +6460,43 @@ class EasySamplerADV(IO.ComfyNode):
         print(f"{CYAN}{BOLD}[EasySamplerADV]{RESET} {stages[stage]}")
 
     @classmethod
+    def apply_denoise_mask(cls, latent, mask):
+        # mask size match
+        if mask.shape[-1] != latent.shape[-1] or mask.shape[-2] != latent.shape[-2]:
+            mask = F.interpolate(mask.float(), size=latent.shape[-2:], mode="nearest")
+
+        return mask
+
+    @classmethod
     def define_schema(cls):
         return IO.Schema(
             node_id="EasySamplerADV",
             display_name="간단 샘플러 어드밴스",
             category="커스텀임베딩/샘플링",
             description="Noise 추가 여부, step 범위, leftover noise 처리, 간단한 간이 인페인팅 등을 제공하는 샘플러.\n"
-                        "마스크를 사용할 시 마스크는 라텐트 크기에 맞게 리사이즈를 해야 합니다.\n"
+                        "훅 로직이 있는 마스크나 로라등을 적용하기 위한 노드입니다.\n"
                         "CPU 모드에서도 충돌을 최소화하며 latent를 초기화하고 샘플링을 수행합니다.\n"
                         "라데온 계열도 돌아가긴 하지만, ROCm 처리 조건이 부족하면 CPU모드로 기동될 수 있습니다.\n"
                         "사용된 시드 값은 CMD에 프린트 로그로 남아있습니다. 시드를 고정하려면 복사해서 붙여넣으면 됩니다.\n"
                         "Quen 계열에도 사용은 가능합니다.\n"
                         "절대 여러장을 동시처리하지 마세요. 샘플러가 터집니다.\n"
-                        "훅 사용 로직을 추가했지만, 시험기능이라 마스크와 같이 쓰면 오버플로우 위험이 있습니다.\n"
-                        "[참고] 베이스 온리(Base Only) 모드에서는 시드가 고정되어 있어도 연산 특성상 결과물이 미세하게 달라질 수 있습니다.",
+                        "훅 샘플러와 달리 시그마 처리에 추가연산을 진행합니다.\n"
+                        "[참고] 베이스 더블(base_double) 모드에서는 시드가 고정되어 있어도 연산 특성상 결과물이 미세하게 달라질 수 있습니다.",
             inputs=[
                 IO.Model.Input("model", tooltip="사용할 모델"),
                 IO.Boolean.Input("disable_noise", default=False, tooltip="노이즈 적용여부 확인"),
-                IO.Mask.Input("mask", tooltip="영역 지정 마스크. 샘플링 참고 자료가 됩니다.", optional=True),
                 IO.Combo.Input("noise_mode", options=["default", "base_double"], default="default",
-                                tooltip="노이즈 적용방식. 노이즈 스타일을 선택지에 따라 다르게 처리합니다. 베이스 더블 사용 시 normalize_noise를 none으로 두시면 안 됩니다."),
+                                tooltip="노이즈 적용 방식. 노이즈 스타일을 선택지에 따라 다르게 처리합니다. 베이스 더블 사용 시 normalize_noise를 none으로 두시면 안 됩니다."),
                 IO.String.Input("seedset", default=0, tooltip="노이즈 시드.0이면 랜덤 시드를 넣고, 시드넘버를 넣은 경우 고정시드로 취급됩니다."),
-                IO.Sigmas.Input("sigmas", tooltip="사용할 시그마 정보. 입력 안할 시 디폴트로 돌아갑니다.", optional=True),
                 IO.Int.Input("steps", default=20, min=1, max=10000, step=1, tooltip="스텝 수. 수텝수가 많아질수록 추가작업이 들어가지만,"
                                 "너무 많은 경우 품질이 떨어질 수 있습니다."),
                 IO.Float.Input("cfg", default=8.0, min=0.0, max=100.0, step=0.1, tooltip="CFG 스케일. 높아질수록 텍스트 처리 강도가 오르지만,\n"
                                    "과하면 품질이 떨어지거나 왜곡될 수 있습니다."),
                 IO.Combo.Input("sampler_name", options=comfy.samplers.KSampler.SAMPLERS, default="euler", tooltip="샘플러 알고리즘"),
                 IO.Combo.Input("scheduler", options=comfy.samplers.KSampler.SCHEDULERS, default="simple", tooltip="스케줄러"),
+                IO.Combo.Input("sigma_curve", options=["Linear", "Strong In", "Strong Out", "Weak In", "Weak Out", "Small Denoise Split"], default="Linear", tooltip="시그마 곡선 및 디노이즈 간섭 제어 방식\n"
+                                "(linear:디폴트, strong in:초반이후 약화, strong out:중반까지 약세-이후 정상화, weak in:초반만 약화-이후 정상화, weak out:후반약화, small denoise split:디노이즈의 시그마 영향 감소)"),
+				IO.Float.Input("weak_amplify", default=1.0, min=1.0, max=2.0, step=0.1, tooltip="시그마 감소치를 조정합니다. 수치가 커질수록 시그마 약화 폭이 커집니다."),
                 IO.Conditioning.Input("positive", tooltip="포지티브 컨디셔닝"),
                 IO.Conditioning.Input("negative", tooltip="네거티브 컨디셔닝"),
                 IO.Latent.Input("latent", tooltip="입력 latent. 빈 라텐트 이미지를 넣거나, 인코딩 또는 불러온 라텐트를 연결할 수 있습니다."),
@@ -5992,6 +6507,7 @@ class EasySamplerADV(IO.ComfyNode):
                 IO.Combo.Input("mode", options=["cpu","nvidia","amd"], default="cpu", tooltip="실행 장치"),
                 IO.Float.Input("denoise", default=1.000, min=0.000, max=1.000, step=0.001, tooltip="디노이즈 강도"),
                 IO.Combo.Input("normalize_noise", options=["none", "soft", "standard"], tooltip="xl계열에서 노이즈 번 에러 발생시 활용가능한 노이즈 안정화", default="none"),
+                IO.Boolean.Input("get_shrinkmask", default=True, tooltip="훅 마스크 확인시 마스크영역을 조금 좁힙니다. 마스크가 없을 시엔 적용되지 않습니다."),
                 IO.Boolean.Input("clear_cache", default=False, tooltip="노드 시작시 캐시 정리")
             ],
             outputs=[
@@ -6000,9 +6516,8 @@ class EasySamplerADV(IO.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, disable_noise, latent, mask=None, noise_mode="default", palette_inject="2",
-                seedset=0, positive=None, negative=None, sigmas=None, steps=20, cfg=8.0, sampler_name="euler",
-                scheduler="simple", height=512, width=512, mode="cpu", denoise=1.000, normalize_noise="none", clear_cache=False) -> IO.NodeOutput:
+    def execute(cls, model, disable_noise, latent, noise_mode="default", seedset=0, positive=None, negative=None, steps=20, cfg=8.0, sampler_name="euler",
+                scheduler="simple", sigma_curve="Linear", weak_amplify=1.0, height=512, width=512, mode="cpu", denoise=1.000, normalize_noise="none", get_shrinkmask=True, clear_cache=False) -> IO.NodeOutput:
 
         cls.show_data_preparation_progress("start")
 
@@ -6030,14 +6545,30 @@ class EasySamplerADV(IO.ComfyNode):
                     print("GPU 캐시 초기화 실패:", e)
             elif device == "cpu":
                 print("CPU 모드: GPU 캐시 초기화 생략")
+
             gc.collect()
             print("CPU 캐시 초기화 완료")
 
         sampler = comfy.samplers.sampler_object(sampler_name)
 
-        positive = get_safe_conditioning(positive, device, model, cfg)
+        positive, pos_hook, pos_masks = get_safe_conditioning_hooked(positive, device, model, cfg)
 
-        negative = get_safe_conditioning(negative, device, model, cfg)
+        negative, neg_hook, neg_masks = get_safe_conditioning_hooked(negative, device, model, cfg)
+
+        findkey = False
+        for cond_list in (positive, negative):
+            if cond_list:
+                for c in cond_list:
+                    if isinstance(c, tuple) and len(c) > 1 and isinstance(c[1], dict):
+                        if c[1].get("masksetkey", False):
+                            findkey = True
+                            break
+                    elif isinstance(c, dict):
+                        if c.get("masksetkey", False):
+                            findkey = True
+                            break
+                if findkey:
+                    break
 
         seed_val = parse_seed(seedset)
         if seed_val == 0:
@@ -6075,38 +6606,42 @@ class EasySamplerADV(IO.ComfyNode):
         target_size = (w, h)
 
         noise_mask = None
-        if mask is not None:
-            if isinstance(mask, dict):
-                if "latent_mask" in mask:
-                    mask = mask["latent_mask"]
-                elif "noise_mask" in mask:
-                    mask = mask["noise_mask"]
-                elif "mask" in mask:
-                    mask = mask["mask"]
-            if mask.dtype == torch.bool:
-                mask = mask.float()
-            denoise_mask = mask
-            noise_mask = cls.apply_denoise_mask(latent_image, denoise_mask)
-            noise_mask = noise_mask.to(device)
+        
+        valid_masks = []
+        if pos_masks:
+            valid_masks.extend([m for m in pos_masks if m is not None])
+        if neg_masks:
+            valid_masks.extend([m for m in neg_masks if m is not None])
 
-        elif isinstance(latent, dict) and "noise_mask" in latent:
-            denoise_mask = latent.get("noise_mask")
-            noise_mask = cls.apply_denoise_mask(latent_image, denoise_mask)
-            noise_mask = noise_mask.to(device)
-            print(f"{CYAN}{BOLD}[EasySamplerADV]{RESET} Latent mask find")
+        if len(valid_masks) > 0:
+            threshold = 0.6
+            noise_mask = prepare_noise_mask(valid_masks, threshold, target_size, get_shrinkmask, findkey)
+            if noise_mask is not None:
+                noise_mask = noise_mask.to(device)
+                print(f"{CYAN}{BOLD}[EasySamplerADV]{RESET} A mask was found during conditioning. Switching to masked region-limited sampling.")
+            else:
+                if findkey:
+                    print(f"{CYAN}{BOLD}[EasySamplerADV]{RESET} MaskBreaker is activated, lifting the mask area restriction. (Global sampling)")
+                else:
+                    print(f"{CYAN}{BOLD}[EasySamplerADV]{RESET} No mask was found in the conditioning. It is being processed using standard sampling.")
+        else:
+            if isinstance(latent, dict) and "noise_mask" in latent:
+                noise_mask = latent.get("noise_mask")
+                print(f"{CYAN}{BOLD}[EasySamplerADV]{RESET} latent mask was found, Switching to masked region-limited sampling.")
+            else:
+                print(f"{CYAN}{BOLD}[EasySamplerADV]{RESET} No connected mask. Processing with standard sampling.")
 
         cls.show_data_preparation_progress("noise set")
 
-        batch_inds = latent.get("batch_index", None)
-
-        inject_level = int(palette_inject) * 0.1
-        inject_level = max(0.0, min(inject_level, 0.5))
+        if isinstance(latent, dict):
+            batch_inds = latent.get("batch_index", None)
+        else:
+            batch_inds = None
 
         if disable_noise:
             noise = torch.zeros_like(latent_image, device=device)
         else:
             noise_base = prepare_noise_safe(latent_image, generator, device, batch_inds)
-
             if noise_mode == "base_double":
                 pure_noise = torch.randn_like(latent_image, generator=generator, device=device)
 
@@ -6121,7 +6656,6 @@ class EasySamplerADV(IO.ComfyNode):
                 # "default"
                 noise = get_processed_noise(noise_base, normalize_noise)
 
-
         # 2. Multy batch remove
         if noise is not None and noise.shape[0] > 1:
             noise = noise[:1]
@@ -6129,23 +6663,25 @@ class EasySamplerADV(IO.ComfyNode):
             latent_image = latent_image[:1]
         cls.show_data_preparation_progress("waiting")
 
-        if sigmas is not None:
-            use_sigmas = sigmas.to(device)
-        else:
-            use_sigmas = get_sigmas(model, scheduler, steps, denoise, device)
+        use_sigmas = get_sigmas(model, scheduler, steps, denoise, device, sigma_curve=sigma_curve, weak_amplify=weak_amplify)
 
         extra = None
         if latent_image.ndim == 5:
             extra = {"is_flow": (latent_image.ndim == 5)}
+            if noise_mask is not None:
+                noise_mask = cls.apply_denoise_mask(latent_image, noise_mask)
+            
 
-        model_options = {"transformer_options": extra or {}}
+        dim = latent_image.ndim
+        shape = latent_image.shape[2:]
+        model_options = build_model_options(use_sigmas, pos_hook, neg_hook, noise_mask, extra_options=extra, latent_shape=shape, latent_dim=dim)
+        
         comfy.samplers.cast_to_load_options(model_options, device=device, dtype=latent_image.dtype)
 
         callback = latent_preview.prepare_callback(model, steps)
         disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
-        samples = comfy.sample.sample_custom(model, noise, cfg, sampler, use_sigmas, positive, negative, latent_image, noise_mask=noise_mask, callback=callback, disable_pbar=disable_pbar, seed=base_seed)
-
+        samples = sampler_edit.sample_custom_edit(model, noise, cfg, sampler, use_sigmas, positive, negative, latent_image, noise_mask=noise_mask, callback=callback, disable_pbar=disable_pbar, seed=base_seed, extra_model_options=model_options)
 
         l_prev = latent.copy()
         l_prev.pop("downscale_ratio_spacial", None)
@@ -6184,7 +6720,7 @@ class EasyLoraVersionChecker(IO.ComfyNode):
                         "일부 학습에서는 LoRA를 LyCORIS처럼 병렬 세팅하거나 메타데이터를 증발시키는 경우가 있어 메타데이터만으로는 감지가 힘들 수 있습니다.",
             inputs=[
                 IO.Combo.Input("lora_file", options=files if files else ["no lora"], default=files[0] if files else "no lora", tooltip="확인할 LoRA 파일"),
-                IO.Int.Input("font_size", default=14, min=8, max=48, tooltip="폰트 크기"),
+                IO.Int.Input("font_size", default=14, min=8, max=48, step=1, tooltip="폰트 크기"),
                 IO.Combo.Input("find_keys", options=["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20"],
                                default="20", tooltip="확인할 키워드 수"),
                 IO.Combo.Input("save_text", options=["off", "on"],
@@ -6468,25 +7004,25 @@ class EasyTextslot(IO.ComfyNode):
                 IO.Image.Input("image", tooltip="대상 이미지"),
                 bubblelayout.Input("b_layout", tooltip="텍스트박스 참고 이미지", optional=True),
                 IO.Combo.Input("font", options=files, default=files[0] if files else "", tooltip="적용할 폰트 파일"),
-                IO.Int.Input("font_size", default=32, min=6, max=48, tooltip="폰트 크기"),
+                IO.Int.Input("font_size", default=32, min=6, max=48, step=1, tooltip="폰트 크기"),
                 IO.Combo.Input("bubble_shape", options=["ellipse", "rounded_rect", "shout", "long_shout", "thought"], default="ellipse", tooltip="말풍선 형태 선택"),
                 IO.String.Input("fill_color", default="#ffffff", tooltip="텍스트박스 색상 (HEX 코드)"),
                 IO.String.Input("outline_color", default="#000000", tooltip="텍스트박스 외곽 색상 (HEX 코드)"),
                 IO.String.Input("text_color", default="#000000", tooltip="글자 색상 (HEX 코드)"),
                 IO.String.Input("text", multiline=True, default="empty text", tooltip="텍스트 기입란"),
-                IO.Int.Input("slot_size_x", default=240, min=8, max=2048, tooltip="텍스트박스 크기(X축)"),
-                IO.Int.Input("slot_size_y", default=100, min=8, max=2048, tooltip="텍스트박스 크기(Y축)"),
-                IO.Int.Input("slot_x", default=8, min=8, max=2048, tooltip="텍스트박스 위치(X축)"),
-                IO.Int.Input("slot_y", default=10, min=8, max=2048, tooltip="텍스트박스 위치(Y축)"),
-                IO.Float.Input("lotate_slot", default=0.0, min=-180.0, max=180.0, tooltip="텍스트박스 회전"),
+                IO.Int.Input("slot_size_x", default=240, min=8, max=2048, step=1, tooltip="텍스트박스 크기(X축)"),
+                IO.Int.Input("slot_size_y", default=100, min=8, max=2048, step=1, tooltip="텍스트박스 크기(Y축)"),
+                IO.Int.Input("slot_x", default=8, min=8, max=2048, step=1, tooltip="텍스트박스 위치(X축)"),
+                IO.Int.Input("slot_y", default=10, min=8, max=2048, step=1, tooltip="텍스트박스 위치(Y축)"),
+                IO.Float.Input("lotate_slot", default=0.0, min=-180.0, max=180.0, step=0.1, tooltip="텍스트박스 회전"),
                 IO.Combo.Input("textbox_Lines", options=["thin", "bold", "outline"], default="thin", tooltip="텍스트박스 형태 지정"),
                 IO.Combo.Input("textbox_blur", options=["basic", "spread"], default="basic", tooltip="텍스트박스 블러처리 여부"),
                 IO.Combo.Input("text_anchor", options=["basic", "left-top", "left-center", "left-bottom", "center", "right-top", "right-center", "right-bottom"], default="basic", tooltip="텍스트 배치"),
                 IO.Combo.Input("text_style", options=["thin", "bold", "outline"], default="thin", tooltip="텍스트 형태 지정"),
                 IO.Combo.Input("text_shadow", options=["basic", "shadow"], default="basic", tooltip="텍스트 그림자 추가 여부"),
-                IO.Int.Input("text_box_opa", default=128, min=0, max=255, tooltip="텍스트박스 투명도 설정. 0(투명)>255(불투명)"),
-                IO.Int.Input("text_Line_opa", default=128, min=0, max=255, tooltip="텍스트박스 라인 투명도 설정. 0(투명)>255(불투명)"),
-                IO.Int.Input("text_opa", default=255, min=0, max=255, tooltip="텍스트 투명도 설정. 0(투명)>255(불투명)"),
+                IO.Int.Input("text_box_opa", default=128, min=0, max=255, step=1, tooltip="텍스트박스 투명도 설정. 0(투명)>255(불투명)"),
+                IO.Int.Input("text_Line_opa", default=128, min=0, max=255, step=1, tooltip="텍스트박스 라인 투명도 설정. 0(투명)>255(불투명)"),
+                IO.Int.Input("text_opa", default=255, min=0, max=255, step=1, tooltip="텍스트 투명도 설정. 0(투명)>255(불투명)"),
             ],
             outputs=[
                 IO.Image.Output("output_image", tooltip="텍스트가 삽입된 이미지")
@@ -6764,7 +7300,7 @@ class LogTranslate(IO.ComfyNode):
                 IO.Combo.Input("set_mode", options=["string", "text"], default="string", tooltip="저장 여부"),
                 IO.String.Input("file_name", default="errorlog_%number", tooltip="텍스트로 저장할 에러 로그명"),
                 IO.Boolean.Input("use_widget", default=False, tooltip="노드 위젯을 켜거나 끕니다."),
-                IO.Int.Input("widgetfont_size", default=14, min=8, max=40, tooltip="노드 위젯이 켜져있을 때 텍스트의 글자 크기를 조정합니다."),
+                IO.Int.Input("widgetfont_size", default=14, min=8, max=40, step=1, tooltip="노드 위젯이 켜져있을 때 텍스트의 글자 크기를 조정합니다."),
             ],
             hidden=[IO.Hidden.prompt],
             is_output_node=True,
