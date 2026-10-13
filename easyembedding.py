@@ -5292,11 +5292,12 @@ class EasyInpaintAndConditioning(IO.ComfyNode):
 
         if pixels.dim() == 4:
             if pixels.shape[-1] == 3:  # [B, H, W, C]
-                h, w = pixels.shape[-2], pixels.shape[-3]
-            else:                      # [B, C, H, W]
-                h, w = pixels.shape[-2], pixels.shape[-1]
+                b, h, w, c = pixels.shape
+            else:  # [B, C, H, W]
+                b, c, h, w = pixels.shape
+                pixels = pixels.permute(0, 2, 3, 1) # [B, H, W, C]
         else:
-            h, w = pixels.shape[-2], pixels.shape[-1]
+            b, h, w, c = pixels.shape
 
  
         x = (w // downscale_ratio) * downscale_ratio
@@ -5310,7 +5311,7 @@ class EasyInpaintAndConditioning(IO.ComfyNode):
         if w != x or h != y:
             x_offset = (w % downscale_ratio) // 2
             y_offset = (h % downscale_ratio) // 2
-            pixels = pixels[:, :, y_offset:y + y_offset, x_offset:x + x_offset]
+            pixels = pixels[:, y_offset:y + y_offset, x_offset:x + x_offset, :]
             mask_tensor = mask_tensor[y_offset:y + y_offset, x_offset:x + x_offset]
 
         if grow_mask_by == 0:
@@ -5402,6 +5403,7 @@ class EasyInpaintAndConditioning(IO.ComfyNode):
         if preview_mode:
             return IO.NodeOutput(out_positive, out_negative, out_latent, blend_latent, ui=UI.PreviewImage(concat_pixels))
         return IO.NodeOutput(out_positive, out_negative, out_latent, blend_latent)
+
 
 #----------------------------------------
 
