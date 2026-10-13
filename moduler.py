@@ -2,10 +2,12 @@ import os
 import torch
 import folder_paths
 import textwrap
+import re, math
 
 from safetensors import safe_open
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
+from .sampler_edit import find_attn_modules
 
 import comfy.utils
 import comfy.sd
@@ -103,6 +105,23 @@ _unetlast_mtime = 0  # For detecting folder state changes
 
 _folder_cache = None
 _vaelast_mtime = 0  # For detecting folder state changes
+
+_DTYPE_BYTES = {"F64": 8, "I64": 8, "U64": 8, "F32": 4, "I32": 4, "U32": 4,
+                "BF16": 2, "F16": 2, "I16": 2, "U16": 2,
+                "I8": 1, "U8": 1, "BOOL": 1, "F8_E4M3": 1, "F8_E5M2": 1}
+
+def _group_of(name):
+    n = name.lower()
+    if "llm_adapter" in n:
+        return "adapter"
+    if n.startswith(("cond_stage_model.", "text_encoders.", "conditioner.")):
+        return "encoder"
+    if n.startswith(("first_stage_model.", "vae.")):
+        return "vae"
+    return "core"
+
+_BLK_PAT = re.compile(r"(?:^|\.)(?:layers|blocks)\.(\d+)\.(self_attn|cross_attn)\.v_proj\.weight$")
+
 #----------------------------------------
 # node base
 #----------------------------------------
@@ -588,7 +607,7 @@ class EasyUnetClipLoader(IO.ComfyNode):
 #----------------------------------------
 
 class EasyUnetChecker(IO.ComfyNode):
-    
+
     @classmethod
     def show_status(cls, stage):
         stages = {
@@ -637,6 +656,7 @@ class EasyUnetChecker(IO.ComfyNode):
 
         cls.show_status("loading")
         total_elements = 0
+        stats = {g: [0, 0] for g in ("core", "adapter", "encoder", "vae")}   # [원소 수, 바이트]
         dtypes = set()
         tensor_names = []
 
@@ -645,23 +665,26 @@ class EasyUnetChecker(IO.ComfyNode):
                 with safe_open(unet_path, framework="pt", device="cpu") as f:
                     tensor_names = list(f.keys())
                     for name in tensor_names:
-                        tensor_slice = f.get_slice(name)
-                        shape = tensor_slice.get_shape()
-                        dt = tensor_slice.get_dtype()
-                        dtypes.add(str(dt))
-                        elements = np.prod(shape)
-                        total_elements += elements
+                        sl = f.get_slice(name)
+                        dt = str(sl.get_dtype()).upper()
+                        n = math.prod(sl.get_shape())
+                        g = _group_of(name)
+                        stats[g][0] += n
+                        stats[g][1] += n * _DTYPE_BYTES.get(dt, 2)
+                        dtypes.add(dt)
             except Exception as e:
                 print(f"[UnetChecker] Failed to read tensors: {e}")
                 tensor_names = []
 
+        core_names = [n for n in tensor_names if _group_of(n) == "core"]
+
         category = "Unknown"
-        if tensor_names:
-            names_lower = [name.lower() for name in tensor_names]
+        if core_names:
+            names_lower = [n.lower() for n in core_names]
             is_quantized = any(q in n for n in names_lower for q in ["qweight", "scales", "zeros", "quant", "ggml"])
-            is_cosmos = any("cosmos" in n or "actor" in n or "net.blocks" in n for n in names_lower)
+            is_cosmos = any("cosmos" in n or "actor." in n or "net.blocks" in n for n in names_lower)
             is_dit = any("diffusion_model" in n or "transformer_blocks" in n or "x_embedder" in n for n in names_lower)
-            is_unet = any("model.diffusion_model.input_blocks" in n or "down_blocks" in n for n in names_lower)
+            is_unet = any("input_blocks" in n or "down_blocks" in n for n in names_lower)
 
             if is_cosmos:
                 category = "Cosmos - Quantized" if is_quantized else "Cosmos - Standard"
@@ -672,8 +695,8 @@ class EasyUnetChecker(IO.ComfyNode):
             else:
                 category = "Unknown"
 
-        bytes_per_elem = 0.5 if ("Quantized" in category) else 2.0
-        estimated_vram = (total_elements * bytes_per_elem) / (1024 ** 3) + 1.5 if total_elements > 0 else 0.0
+        load_bytes = stats["core"][1] + stats["adapter"][1]
+        estimated_vram = load_bytes / (1024 ** 3) + 1.5 if load_bytes else 0.0
 
         found_attn_keys = {}
         
@@ -681,14 +704,21 @@ class EasyUnetChecker(IO.ComfyNode):
             "qkv", "query_key_value",
             "to_q", "to_k", "to_v",
             "query", "key", "value",
+            "q_proj", "k_proj", "v_proj",
             "q", "k", "v"
         ]
+        search_pool = [n for n in core_names if "self_attn" in n] or core_names
+        blk = {"self_attn": set(), "cross_attn": set()}
+        for n in core_names:
+            m = _BLK_PAT.search(n)
+            if m:
+                blk[m.group(2)].add(int(m.group(1)))
 
         for pattern in search_patterns:
             if pattern in found_attn_keys:
                 continue
             
-            for name in tensor_names:
+            for name in search_pool:
                 name_lower = name.lower()
                 if len(pattern) == 1:
                     if f".{pattern}." in name_lower or name_lower.endswith(f".{pattern}") or f"_{pattern}." in name_lower or name_lower.startswith(f"{pattern}."):
@@ -702,11 +732,15 @@ class EasyUnetChecker(IO.ComfyNode):
 
         # textwrap
         wrapped_file = textwrap.fill(f"File: {file_name}", width=35)
+        def _b(g): return f"{stats[g][0] / 1e9:.2f}B"
+        parts = [f"core {_b('core')}"] + [f"{g} {_b(g)}" for g in ("adapter", "encoder", "vae") if stats[g][0]]
+
         raw_lines = [
             wrapped_file,
-            f"Parameters: ~{total_elements / 1e9:.2f}B",
+            "Parameters: " + " / ".join(parts),
             f"Est. VRAM: ~{estimated_vram:.1f} GB",
-            f"Dtype: {list(dtypes)[:2] if dtypes else ['N/A']}",
+            f"Dtype: {sorted(dtypes) if dtypes else ['N/A']}",
+            f"Attn blocks: self={len(blk['self_attn'])} cross={len(blk['cross_attn'])}",
             "Category:",
             f"> {category}"
         ]
