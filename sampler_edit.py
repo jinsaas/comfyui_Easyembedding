@@ -37,6 +37,8 @@ def find_attn_modules(root, kind="self_attn"):
             found.setdefault(int(m.group(1)), {})[m.group(3)] = name
     return found   # {0: {'q': ..., 'k': ..., 'v': ...}, 1: ...}
 
+
+
 def editcond_set_values_with_timestep_range(conditioning, values={}, start_percent=0.0, end_percent=1.0):
 
     if start_percent > end_percent:
