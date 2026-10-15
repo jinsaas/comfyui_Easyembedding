@@ -683,6 +683,32 @@ class EasyUnetChecker(IO.ComfyNode):
 
         core_names = [n for n in tensor_names if _group_of(n) == "core"]
 
+        found_layers_map = {}
+        _ATTN_PAT = re.compile(r"(?:^|\.)(?:layers|blocks)\.(\d+)\.(self_attn|cross_attn)\.([qkv])_proj$")
+        
+        for name in tensor_names:
+            if "llm_adapter" in name.lower():
+                continue
+            m = _ATTN_PAT.search(name)
+            if m:
+                layer_idx = int(m.group(1))
+                attn_type = m.group(2)
+                qkv_type = m.group(3)
+                found_layers_map.setdefault(layer_idx, {}).setdefault(attn_type, {})[qkv_type] = name
+        layer_indices = set()
+        for n in core_names:
+            m = _BLK_PAT.search(n)
+            if m:
+                layer_indices.add(int(m.group(1)))
+        # min, max, count
+        if layer_indices:
+            min_layer = min(layer_indices)
+            max_layer = max(layer_indices)
+            layer_count = len(layer_indices)
+            layer_str = f"Layers: min={min_layer}, max={max_layer}, count={layer_count}"
+        else:
+            layer_str = "Layers: N/A"
+
         category = "Unknown"
         if core_names:
             names_lower = [n.lower() for n in core_names]
@@ -707,10 +733,10 @@ class EasyUnetChecker(IO.ComfyNode):
         
         search_patterns = [
             "qkv", "query_key_value",
-            "to_q", "to_k", "to_v",
-            "query", "key", "value",
-            "q_proj", "k_proj", "v_proj",
-            "q", "k", "v"
+            "to_q", "to_k", "to_v", "to_o",
+            "query", "key", "value", "output",
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "q", "k", "v", "o"
         ]
         search_pool = [n for n in core_names if "self_attn" in n] or core_names
         blk = {"self_attn": set(), "cross_attn": set()}
@@ -734,7 +760,6 @@ class EasyUnetChecker(IO.ComfyNode):
                         found_attn_keys[pattern] = name
                         break
 
-
         # textwrap
         wrapped_file = textwrap.fill(f"File: {file_name}", width=35)
         def _b(g): return f"{stats[g][0] / 1e9:.2f}B"
@@ -745,6 +770,7 @@ class EasyUnetChecker(IO.ComfyNode):
             "Parameters: " + " / ".join(parts),
             f"Est. VRAM: ~{estimated_vram:.1f} GB",
             f"Dtype: {sorted(dtypes) if dtypes else ['N/A']}",
+            layer_str,
             f"Attn blocks: self={len(blk['self_attn'])} cross={len(blk['cross_attn'])}",
             "Category:",
             f"> {category}"
@@ -754,7 +780,9 @@ class EasyUnetChecker(IO.ComfyNode):
             raw_lines.append("Attn Keys (Found):")
             for pat, real_name in found_attn_keys.items():
                 raw_lines.append(f"• [{pat}] {os.path.basename(real_name) if len(real_name) > 30 else real_name}")
-
+        if found_layers_map:
+            max_layer = max(found_layers_map.keys())
+            raw_lines.append(f"Detected Attention Layers: 0 ~ {max_layer} (Total {len(found_layers_map)} layers)")
         text_output_str = "\n".join(raw_lines)
 
         if show_preview:
