@@ -1,3 +1,9 @@
+
+#----------------------------------------
+# pose code
+#----------------------------------------
+
+
 import os
 import torch
 import numpy as np
@@ -186,8 +192,8 @@ class EasyOpenPoseEditor(IO.ComfyNode):
             canvas = np.zeros((exp_h, exp_w, 3), dtype=np.uint8)
         else:
             pad_y, pad_x = 0, 0
-            canvas = arr
             exp_h, exp_w = h, w
+            canvas = np.zeros((exp_h, exp_w, 3), dtype=np.uint8)
 
         if preview_basebg:
             if expand_ratio > 0:
