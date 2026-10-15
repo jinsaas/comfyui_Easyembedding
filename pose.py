@@ -11,7 +11,7 @@ import comfy.utils
 import comfy.sd
 from comfy_api.latest import IO, UI
 
-# cnt 폴더 경로 지정
+# cnt folder path
 CNT_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cnt")
 os.makedirs(CNT_DIR, exist_ok=True)
 
@@ -47,7 +47,7 @@ class EasyOpenPoseEditor(IO.ComfyNode):
         "right": (255, 0, 128),
     }
 
-    # 뼈대(Edge) 연결 구조 정의 (시작점, 끝점, 매칭될 색상 키)
+    # Define the edge connection structure (start point, end point, matching color key)
     BONE_CONNECTIONS = [
         ("Nose", "REye", "right"), 
         ("REye", "REar", "right"),
@@ -81,7 +81,7 @@ class EasyOpenPoseEditor(IO.ComfyNode):
     def define_schema(cls):
         default_pose_str = "Nose{256,50}, Neck{256,100}, REye{246,40}, LEye{266,40}, REar{236,45}, LEar{276,45}, Chest{256,150}, MidHip{256,250}, LShoulder{312,110}, RShoulder{200,110}, LElbow{330,170}, RElbow{182,170}, LHand{340,230}, RHand{172,230}, LHip{280,250}, RHip{232,250}, LKnee{285,350}, RKnee{227,350}, LFeet{290,450}, RFeet{222,450}"
 
-        # 파일 목록 구성
+        # Organize file lists
         os.makedirs(CNT_DIR, exist_ok=True)
         files = []
         try:
@@ -107,13 +107,13 @@ class EasyOpenPoseEditor(IO.ComfyNode):
                     if content:
                         default_pose_str = content
             else:
-                # openpose_default.txt 없으면 생성
+                # If not found, create the file openpose_default.txt
                 default_path = os.path.join(CNT_DIR, "openpose_default.txt")
                 if not os.path.exists(default_path):
                     with open(default_path, "w", encoding="utf-8") as f:
                         f.write(default_pose_str)
                     print(f"[EasyOpenPoseEditor] Created initial pose file: cnt/openpose_default.txt")
-                    # 목록에 추가
+                    # Add to list
                     if "openpose_default.txt" not in pose_file_list:
                         pose_file_list.append("openpose_default.txt")
         except Exception as e:
@@ -159,7 +159,7 @@ class EasyOpenPoseEditor(IO.ComfyNode):
     def execute(cls, image, expand_ratio=0, pose_image=None, load_pose_file="none", load_lock=False, pose_points="Nose{256,50}, Neck{256,100}, REye{246,40}, LEye{266,40}, REar{236,45}, LEar{276,45}, Chest{256,150}, MidHip{256,250}, LShoulder{312,110}, RShoulder{200,110}, LElbow{330,170}, RElbow{182,170}, LHand{340,230}, RHand{172,230}, LHip{280,250}, RHip{232,250}, LKnee{285,350}, RKnee{227,350}, LFeet{290,450}, RFeet{222,450}", 
                 remap_pose=False, ref_switch=False, guide_preview=True, guide_color="green", preview_basebg=True, canvas_size=400, point_radius=4.0, line_thickness=3, save_pose=False) -> IO.NodeOutput:
         
-        # 1. 배경 이미지 기본 처리
+        # 1. Basic Background Image Processing
 
         if isinstance(image, torch.Tensor):
             arr = image.cpu().numpy()[0]
@@ -200,7 +200,7 @@ class EasyOpenPoseEditor(IO.ComfyNode):
         else:
             b64_img = ""
 
-        # 2. 포즈 문자열 파싱 및 좌표 스케일링 준비 (로드락 적용)
+        # 2. Preparing pose string parsing and coordinate scaling (with load lock applied)
         parsed_joints = {}
         DEFAULT_POSE = "Nose{256,50}, Neck{256,100}, REye{246,40}, LEye{266,40}, REar{236,45}, LEar{276,45}, Chest{256,150}, MidHip{256,250}, LShoulder{312,110}, RShoulder{200,110}, LElbow{330,170}, RElbow{182,170}, LHand{340,230}, RHand{172,230}, LHip{280,250}, RHip{232,250}, LKnee{285,350}, RKnee{227,350}, LFeet{290,450}, RFeet{222,450}"
 
@@ -214,7 +214,7 @@ class EasyOpenPoseEditor(IO.ComfyNode):
                         loaded_pose_str = file_content
                         print(f"[EasyOpenPoseEditor] SUCCESS: Loaded pose from cnt/{load_pose_file}")
 
-        # 2. [오픈포즈 이미지(pose_image)가 입력된 경우]
+        # 2. [If an open pose image (pose_image) is entered]
         if pose_image is not None:
             pose_arr = pose_image.cpu().numpy()[0] if isinstance(pose_image, torch.Tensor) else np.array(pose_image)
             if pose_arr.max() <= 1.0:
@@ -234,7 +234,7 @@ class EasyOpenPoseEditor(IO.ComfyNode):
                     else:
                         parsed_joints[joint_name] = (cx, cy)
 
-        # 3. [텍스트/드래그 좌표 문자열 처리] (파일 로드가 성공했거나, 기존 입력된 pose_points가 있는 경우)
+        # 3. [Text/Drag Coordinate String Processing] (When file loading is successful or existing pose points are present)
         elif loaded_pose_str or (pose_points and pose_points.strip() != ""):
             target_str = loaded_pose_str if loaded_pose_str else pose_points
             active_pose_str = re.sub(r'\s+', ' ', target_str).strip()
@@ -253,7 +253,7 @@ class EasyOpenPoseEditor(IO.ComfyNode):
                     key = name if name in cls.JOINT_COLORS else name.capitalize()
                     parsed_joints[key] = (new_x, new_y)
 
-        # 4. [예외 처리: 입력된 좌표가 아예 없을 경우] 디폴트 생성
+        # 4. [Exception handling: when no coordinates are entered] default generation
         else:
             print(f"[EasyOpenPoseEditor] Warning: 입력된 포즈 데이터가 없어 기본 포즈를 생성합니다.")
             matches = re.findall(r"([A-Za-z0-9_]+)\s*\{\s*([0-9\.]+)\s*,\s*([0-9\.]+)\s*\}", DEFAULT_POSE)
@@ -261,24 +261,24 @@ class EasyOpenPoseEditor(IO.ComfyNode):
                 key = name if name in cls.JOINT_COLORS else name.capitalize()
                 parsed_joints[key] = (float(x_str), float(y_str))
 
-        # Neck 자동 계산
+        # Neck auto calculation
         if "Neck" not in parsed_joints and "Nose" in parsed_joints and "Chest" in parsed_joints:
             nx = (parsed_joints["Nose"][0] + parsed_joints["Chest"][0]) / 2
             ny = (parsed_joints["Nose"][1] + parsed_joints["Chest"][1]) / 2
             parsed_joints["Neck"] = (nx, ny)
 
-        # MidHip 자동 계산
+        # MidHip auto calculation
         if "MidHip" not in parsed_joints and "LHip" in parsed_joints and "RHip" in parsed_joints:
             mx = (parsed_joints["LHip"][0] + parsed_joints["RHip"][0]) / 2
             my = (parsed_joints["LHip"][1] + parsed_joints["RHip"][1]) / 2
             parsed_joints["MidHip"] = (mx, my)
 
-        # 최종 좌표 문자열 재생성
+        # Reshape the final coordinate string
         active_pose_str = ",".join([f"{name}{{{int(x)},{int(y)}}}" for name,(x,y) in parsed_joints.items()])
 
         output_arr = canvas.copy()
 
-        # 3. 뼈대(Edges) 드로잉 루프
+        # 3. Bones (Edges) Drawing Loop
         for p1, p2, color_key in cls.BONE_CONNECTIONS:
             if p1 in parsed_joints and p2 in parsed_joints:
                 pt1 = (int(parsed_joints[p1][0] + pad_x), int(parsed_joints[p1][1] + pad_y))
@@ -286,7 +286,7 @@ class EasyOpenPoseEditor(IO.ComfyNode):
                 bgr_color = cls.BONE_COLORS.get(color_key, (0, 255, 0))
                 cv2.line(output_arr, pt1, pt2, bgr_color, line_thickness, cv2.LINE_AA)
 
-        # 4. 관절 점(Vertices) 드로잉 루프
+        # 4. Joint vertex drawing loop
         for name, (px, py) in parsed_joints.items():
             bgr_x, bgr_y = int(px + pad_x), int(py + pad_y)
             bgr_color = cls.JOINT_COLORS.get(name, (0, 255, 0))
@@ -325,14 +325,14 @@ class EasyOpenPoseEditor(IO.ComfyNode):
             except Exception as e:
                 print(f"[EasyOpenPoseEditor] Failed to save pose: {e}")
 
-        # 5. Tensor 변환 후 출력
+        # 5. Tensor Output after conversion
         final_tensor = torch.from_numpy(final_output_arr.astype(np.float32) / 255.0).unsqueeze(0)
         ui_data = {"b64_img": [b64_img]}
         if load_lock and load_pose_file != "none":
-            # 파일을 읽어온 좌표를 pose_points에 반영
+            # Match the coordinates read from the file to the pose_points
             ui_data["pose_points_updated"] = [active_pose_str]
         else:
-            # 입력 좌표 및 자동 계산된 좌표를 그대로 반영
+            # Apply input coordinates and provide automatically calculated coordinates each time a coordinate changes
             ui_data["pose_points_updated"] = [active_pose_str]
 
         return IO.NodeOutput(final_tensor, active_pose_str, ui=ui_data)
