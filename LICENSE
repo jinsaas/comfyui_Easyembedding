@@ -19,3 +19,11 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+#-
+The code included in the Dying Code files is from what I had previously used and discarded, 
+so you can use it without worrying about the license if for reference. 
+In that case, please provide only the basic license for the external license.
+
+다잉 코드 파일에 들어간 코드들은 기존에 쓰다가 폐기한 거라 참고용으로 쓸 시엔 라이선스 상관안하고 사용하셔도 됩니다. 
+그 경우 외부 라이선스에 들어간 comfyui 기본 라이선스만 제시해주세요.
