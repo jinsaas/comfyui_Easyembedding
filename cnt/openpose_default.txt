@@ -1,0 +1,1 @@
+Nose{256,50}, Neck{256,100}, REye{246,40}, LEye{266,40}, REar{236,45}, LEar{276,45}, Chest{256,150}, MidHip{256,250}, LShoulder{312,110}, RShoulder{200,110}, LElbow{330,170}, RElbow{182,170}, LHand{340,230}, RHand{172,230}, LHip{280,250}, RHip{232,250}, LKnee{285,350}, RKnee{227,350}, LFeet{290,450}, RFeet{222,450}
