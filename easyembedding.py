@@ -12,6 +12,7 @@ import torchvision.transforms.functional as TF
 import cv2
 import numpy as np
 import re
+import weakref
 import gc
 from safetensors.torch import load_file, save_file, safe_open
 import folder_paths
@@ -837,6 +838,57 @@ CYAN = "\033[36m"
 YELLOW = "\033[33m"
 GREEN = "\033[32m"
 
+_MODEL_METADATA_CACHE = weakref.WeakKeyDictionary()
+
+def get_runtime_unet_metadata(model):
+
+    # Accessing the ComfyUI internal diffusion_model module
+    diffusion_model = getattr(model, "diffusion_model", None)
+    if diffusion_model is None and hasattr(model, "model"):
+        diffusion_model = getattr(model.model, "diffusion_model", None)
+
+    if diffusion_model is None:
+        return None
+
+    # WeakKeyDictionary를 통한 안전한 메모리 캐싱
+    if diffusion_model in _MODEL_METADATA_CACHE:
+        return _MODEL_METADATA_CACHE[diffusion_model]
+
+    # 1. Layer q, k, v real tensor key name full structure
+    found_layers_map = {}
+    layer_indices = set()
+    
+    # Accessing the ComfyUI internal diffusion_model module
+    _ATTN_PAT = re.compile(r"(?:^|\.)(?:layers|blocks)\.(\d+)\.(self_attn|cross_attn)\.([qkv])_proj$")
+    _BLK_PAT = re.compile(r"(?:^|\.)(?:layers|blocks)\.(\d+)\.")
+
+    for name, module in diffusion_model.named_modules():
+        if "llm_adapter" in name.lower():
+            continue
+        
+        m_attn = _ATTN_PAT.search(name)
+        if m_attn:
+            layer_idx = int(m_attn.group(1))
+            attn_type = m_attn.group(2)
+            qkv_type = m_attn.group(3)
+            found_layers_map.setdefault(layer_idx, {}).setdefault(attn_type, {})[qkv_type] = module
+
+        # Block index collection
+        m_blk = _BLK_PAT.search(name)
+        if m_blk:
+            layer_indices.add(int(m_blk.group(1)))
+
+    metadata = {
+        "layer_count": len(layer_indices),
+        "min_layer": min(layer_indices) if layer_indices else 0,
+        "max_layer": max(layer_indices) if layer_indices else 0,
+        "layers_map": found_layers_map
+    }
+
+    # Save to cache
+    _MODEL_METADATA_CACHE[diffusion_model] = metadata
+    return metadata
+
 def get_safe_conditioning(cond, device, model, cfg):
     if cond is None or (isinstance(cond, list) and len(cond) == 0):
         cond = model.cond_stage_model.get_empty_conditioning()
@@ -1054,7 +1106,7 @@ def get_style_transfer_hooks(transfer_str, style_type, palette_features, w=1.0, 
 
     return apply_style_hook
 
-def build_style_transfer_model_options(img_guide_options, sigmas, extra_options=None, latent_shape=None, noise_mask=None, latent_dim=None):
+def build_style_transfer_model_options(img_guide_options, sigmas, extra_options=None, latent_shape=None, noise_mask=None, latent_dim=None, m_layers=None):
     palette_features = img_guide_options.get("palette_features", None)
     style_type = img_guide_options.get("style_type", "Pass")
     style_str = img_guide_options.get("style_str", 1.0)
@@ -1109,20 +1161,18 @@ def build_style_transfer_model_options(img_guide_options, sigmas, extra_options=
     
     patches = {}
 
-    if layers_dict and layernum > 0:
-        for i in range(layernum):
-            for target_type, base_name in layers_dict.items():
-                if not base_name:
-                    continue
-
-                dynamic_key = base_name
-                if "layers." in dynamic_key:
-                    parts = dynamic_key.split("layers.")
-                    sub_parts = parts[1].split(".")
-                    sub_parts[0] = str(i) # Index replacement
-                    dynamic_key = parts[0] + "layers." + ".".join(sub_parts)
-
-                patches[dynamic_key] = style_patch
+    if m_layers and "mlayer_map" in m_layers and layernum > 0:
+        layers_map = m_layers["mlayer_map"]
+        
+        for layer_idx in range(min(layernum, len(layers_map))):
+            if layer_idx not in layers_map:
+                continue
+            
+            attn_blocks = layers_map[layer_idx]
+            for attn_type, qkv_dict in attn_blocks.items():
+                for qkv_type, real_tensor_name in qkv_dict.items():
+                    if not layers_dict or qkv_type in layers_dict or any(k in real_tensor_name for k in layers_dict.values()):
+                        patches[real_tensor_name] = style_patch
                 
     else:
         # Fall-back
@@ -1299,7 +1349,7 @@ def get_latent_transfer_hooks(transfer_str, style_type, ref_latent_features, wei
 
     return apply_latent_hook
 
-def build_style_transfer_lat_model_options(latent_guide_options, sigmas, extra_options=None, noise_mask=None, latent_shape=None, latent_dim=None):
+def build_style_transfer_lat_model_options(latent_guide_options, sigmas, extra_options=None, noise_mask=None, latent_shape=None, latent_dim=None, m_layers=None):
 
     if "spatial_features" in latent_guide_options:
         ref_weight = latent_guide_options.get("spatial_weight", 1.00)
@@ -1360,20 +1410,18 @@ def build_style_transfer_lat_model_options(latent_guide_options, sigmas, extra_o
     
     patches = {}
 
-    if layers_dict and layernum > 0:
-        for i in range(layernum):
-            for target_type, base_name in layers_dict.items():
-                if not base_name:
-                    continue
-
-                dynamic_key = base_name
-                if "layers." in dynamic_key:
-                    parts = dynamic_key.split("layers.")
-                    sub_parts = parts[1].split(".")
-                    sub_parts[0] = str(i)  # Index replacement
-                    dynamic_key = parts[0] + "layers." + ".".join(sub_parts)
-
-                patches[dynamic_key] = style_patch
+    if m_layers and "mlayer_map" in m_layers and layernum > 0:
+        layers_map = m_layers["mlayer_map"]
+        
+        for layer_idx in range(min(layernum, len(layers_map))):
+            if layer_idx not in layers_map:
+                continue
+            
+            attn_blocks = layers_map[layer_idx]
+            for attn_type, qkv_dict in attn_blocks.items():
+                for qkv_type, real_tensor_name in qkv_dict.items():
+                    if not layers_dict or qkv_type in layers_dict or any(k in real_tensor_name for k in layers_dict.values()):
+                        patches[real_tensor_name] = style_patch
     else:
         if is_flow_model:
             patches["self_attn.q_proj"] = style_patch
@@ -1393,7 +1441,7 @@ def build_style_transfer_lat_model_options(latent_guide_options, sigmas, extra_o
 
     return model_options
 
-def build_model_options(sigmas, pos_hook=None, neg_hook=None, noise_mask=None, extra_options=None, latent_shape=None, latent_dim=None):
+def build_model_options(sigmas, pos_hook=None, neg_hook=None, noise_mask=None, extra_options=None, latent_shape=None, latent_dim=None, m_layers=None):
     model_options = {"hooks": {}, "transformer_options": {}}
     
     if pos_hook: 
@@ -1447,7 +1495,7 @@ def build_model_options(sigmas, pos_hook=None, neg_hook=None, noise_mask=None, e
     # Final data injection
     # ----------------------------------------------------
     if latent_guide_options:
-        lat_model_opts = build_style_transfer_lat_model_options(latent_guide_options, sigmas, extra_options, noise_mask, latent_shape=None, latent_dim=None)
+        lat_model_opts = build_style_transfer_lat_model_options(latent_guide_options, sigmas, extra_options, noise_mask, latent_shape=latent_shape, latent_dim=latent_dim, m_layers=m_layers)
         if "transformer_options" in lat_model_opts:
             model_options["transformer_options"].update(lat_model_opts["transformer_options"])
 
@@ -1456,7 +1504,7 @@ def build_model_options(sigmas, pos_hook=None, neg_hook=None, noise_mask=None, e
             print(f"\033[33m[Warning]\033[0m 라텐트 가이드와 이미지 가이드가 동시에 감지되었습니다. 안전을 위해 라텐트 가이드만 적용됩니다.")
             pass
         else:
-            img_model_opts = build_style_transfer_model_options(img_guide_options, sigmas, extra_options, noise_mask, latent_shape=None, latent_dim=None)
+            img_model_opts = build_style_transfer_model_options(img_guide_options, sigmas, extra_options, noise_mask, latent_shape=latent_shape, latent_dim=latent_dim, m_layers=m_layers)
             if "transformer_options" in img_model_opts:
                 model_options["transformer_options"].update(img_model_opts["transformer_options"])
 
@@ -4379,8 +4427,12 @@ class EasyencoderChecker(IO.ComfyNode):
                 break
 
         vision_keys = ["vision_model", "patch_embedding", "visual_projection", "conv1.weight", "class_embedding"]
-        attn_keywords = ["qkv", "to_q", "to_k", "to_v", "query", "key", "value", "q_proj", "k_proj", "v_proj", "o_proj", "query", "key", "value", "attn", "_q", "_k", "_v"]
+        attn_keywords = ["qkv", "to_q", "to_k", "to_v", "query", "key", "value", "q_proj", "k_proj", "v_proj", "o_proj", "query", "key", "value", "_q", "_k", "_v"]
+        act_attn_keywords = ["self_attn", "cross_attn", "attn"]
 
+        found_self_attn = {}
+        found_cross_attn = {}
+        found_act_keys = set()
         if tensor is not None:
             tokens = tensor.shape[0] if len(tensor.shape) > 1 else 1
             dim = tensor.shape[-1]
@@ -4403,6 +4455,7 @@ class EasyencoderChecker(IO.ComfyNode):
         layer_indices = []
         if isinstance(loaded, dict):
             for name in loaded.keys():
+                name_lower = name.lower()
                 if "layers." in name:
                     try:
                         idx_str = name.split("layers.")[1].split(".")[0]
@@ -4410,6 +4463,20 @@ class EasyencoderChecker(IO.ComfyNode):
                         layer_indices.append(idx)
                     except ValueError:
                         continue
+
+                for act_kw in act_attn_keywords:
+                    if act_kw in name_lower and act_kw not in found_act_keys:
+                        found_act_keys.add(act_kw)
+
+                for akw in act_attn_keywords:
+                    if akw in name_lower:
+                        if "cross_attn" in name_lower:
+                            if akw not in found_cross_attn:
+                                found_cross_attn[akw] = name
+                        else:
+                            if akw not in found_self_attn:
+                                found_self_attn[akw] = name
+                        break
 
             if isinstance(loaded, dict):
                 for name in loaded.keys():
@@ -4456,7 +4523,23 @@ class EasyencoderChecker(IO.ComfyNode):
             for pat, real_name in found_attn_keys.items():
                 short_name = os.path.basename(real_name) if len(real_name) > 30 else real_name
                 raw_lines.append(f"  - [{pat}] {short_name}")
+        if act_attn_keywords:
+            raw_lines.append("Cross_Attn Keys (Found):")
+            if found_cross_attn:
+                for pat, real_name in found_cross_attn.items():
+                    short_name = os.path.basename(real_name) if len(real_name) > 30 else real_name
+                    raw_lines.append(f"  - [{pat}] {short_name}")
+            else:
+                raw_lines.append("  - (None: Pure Self-Attention Architecture)")
 
+            # Self-Attention 출력부
+            raw_lines.append("Self_Attn Keys (Found):")
+            if found_self_attn:
+                for pat, real_name in found_self_attn.items():
+                    short_name = os.path.basename(real_name) if len(real_name) > 30 else real_name
+                    raw_lines.append(f"  - [{pat}] {short_name}")
+            else:
+                raw_lines.append("  - (None found)")
         if not found_attn_keys:
             raw_lines.append("DEBUG: Raw Key Sample:")
             if isinstance(loaded, (list, tuple)):
@@ -6312,6 +6395,16 @@ class EasySamplerHook(IO.ComfyNode):
             gc.collect()
             print("CPU 캐시 초기화 완료")
 
+        m_layers = {}
+        meta = get_runtime_unet_metadata(model)
+
+        if meta is not None:
+            m_layer_count = meta["layer_count"]
+            m_layers_map = meta["layers_map"]
+            m_layers.update({"mlayer_cnt":m_layer_count, "mlayer_map":m_layers_map})
+            print(f"[easySampler] Successfully analyzed model: {m_layer_count} layers detected.")
+        else:
+            print(f"[easySampler] Warning: Could not extract layer metadata from model. Proceeding with empty layer map.")
         sampler = comfy.samplers.sampler_object(sampler_name)
 
         positive, pos_hook, pos_masks = get_safe_conditioning_hooked(positive, device, model, cfg)
@@ -6437,7 +6530,7 @@ class EasySamplerHook(IO.ComfyNode):
 
         dim = latent_image.ndim
         shape = latent_image.shape[2:]
-        model_options = build_model_options(use_sigmas, pos_hook, neg_hook, noise_mask, extra_options=extra, latent_shape=shape, latent_dim=dim)
+        model_options = build_model_options(use_sigmas, pos_hook, neg_hook, noise_mask, extra_options=extra, latent_shape=shape, latent_dim=dim, m_layers=m_layers)
         
         comfy.samplers.cast_to_load_options(model_options, device=device, dtype=latent_image.dtype)
 
@@ -6561,6 +6654,17 @@ class EasySamplerADV(IO.ComfyNode):
 
             gc.collect()
             print("CPU 캐시 초기화 완료")
+
+        m_layers = {}
+        meta = get_runtime_unet_metadata(model)
+
+        if meta is not None:
+            m_layer_count = meta["layer_count"]
+            m_layers_map = meta["layers_map"]
+            m_layers.update({"mlayer_cnt":m_layer_count, "mlayer_map":m_layers_map})
+            print(f"[easySampler] Successfully analyzed model: {m_layer_count} layers detected.")
+        else:
+            print(f"[easySampler] Warning: Could not extract layer metadata from model. Proceeding with empty layer map.")
 
         sampler = comfy.samplers.sampler_object(sampler_name)
 
@@ -6687,7 +6791,7 @@ class EasySamplerADV(IO.ComfyNode):
 
         dim = latent_image.ndim
         shape = latent_image.shape[2:]
-        model_options = build_model_options(use_sigmas, pos_hook, neg_hook, noise_mask, extra_options=extra, latent_shape=shape, latent_dim=dim)
+        model_options = build_model_options(use_sigmas, pos_hook, neg_hook, noise_mask, extra_options=extra, latent_shape=shape, latent_dim=dim, m_layers=m_layers)
         
         comfy.samplers.cast_to_load_options(model_options, device=device, dtype=latent_image.dtype)
 
@@ -7432,6 +7536,7 @@ EMB_NODE_CLASS_MAPPINGS = {
     "EasyMultyVaeEncode": EasyMultyVaeEncode,
     "EasyInpaintAndConditioning": EasyInpaintAndConditioning,
     "EasyInpaintAndConditioning_modify": EasyInpaintAndConditioning_modify,
+    "EasyInpaintAndConditioning_cnt": EasyInpaintAndConditioning_cnt,
     "EasySamplerHook": EasySamplerHook,
     "EasySamplerADV": EasySamplerADV,
     "EasyLoraVersionChecker": EasyLoraVersionChecker,
@@ -7470,6 +7575,7 @@ EMB_NODE_DISPLAY_NAME_MAPPINGS = {
     "EasyMultyVaeEncode": "간단 Vae 멀티인코드",
     "EasyInpaintAndConditioning": "간단 인페인트 및 컨디셔닝",
     "EasyInpaintAndConditioning_modify": "간단 인페인트 및 컨디셔닝(모드)",
+    "EasyInpaintAndConditioning_cnt": "간단 인페인트 및 컨디셔닝(스페이셜 가이드)",
     "EasySamplerHook": "간단 훅 샘플러",
     "EasySamplerADV": "간단 샘플러 어드밴스",
     "EasyLoraVersionChecker": "LoRA 버전 체커",
