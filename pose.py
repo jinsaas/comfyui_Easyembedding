@@ -148,7 +148,7 @@ class EasyOpenPoseEditor(IO.ComfyNode):
                 IO.Boolean.Input("guide_preview", default=True, tooltip="좌표 라벨 및 번호 표시 여부"),
                 IO.Combo.Input("guide_color", options=["green", "red", "blue", "yellow"], default="green", tooltip="좌표 라벨 컬러.가이드 프리뷰가 켜져있을 때만 작동합니다."),
                 IO.Boolean.Input("preview_basebg", default=True, tooltip="프리뷰 이미지를 배경에 넣을지 선택합니다."),
-                IO.Int.Input("canvas_size", min=300, max=800, step=4, default=400, tooltip="에디터 위젯 캔버스의 화면 표시 크기 (픽셀)"),
+                IO.Int.Input("canvas_size", min=300, max=2048, step=4, default=400, tooltip="에디터 위젯 캔버스의 화면 표시 크기 (픽셀)"),
                 IO.Float.Input("point_radius", min=1.0, max=20.0, step=0.5, default=4.0, tooltip="관절 점의 반경 크기"),
                 IO.Int.Input("line_thickness", min=1, max=10, step=1, default=3, tooltip="뼈대 선의 두께"),
                 IO.Boolean.Input("save_pose", default=False, tooltip="현재 pose_points를 cnt 폴더에 저장"),
