@@ -12,7 +12,7 @@ import re, math
 from safetensors import safe_open
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
-from . import sampler_edit
+from .sampler_edit import find_attn_modules
 
 import comfy.utils
 import comfy.sd
