@@ -21,6 +21,7 @@ ComfyUI의 텍스트 프롬프트, 샘플러 및 임베딩 노드를 연결하�
 본 프로젝트는 ComfyUI(AGPL-3.0)를 기반으로 수정되었으며, 원본 라이선스는 external_licenses 디렉토리에 포함되어 있습니다
 
 ###requirements.txt가 비어 있는 이유###
+
 ComfyUI는 확장팩 로딩 시 requirements.txt를 자동 설치합니다.
 그러나 pip나 git을 통한 원격설치 방식은 환경 손상 위험이 매우 높기 때문에,
 requirements.txt를 빈 파일로 유지합니다.
