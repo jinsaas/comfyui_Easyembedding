@@ -1113,10 +1113,20 @@ def build_style_transfer_model_options(img_guide_options, sigmas, extra_options=
 
     device=sigmas.device
     max_val = float(ref_weight) * float(transfer_str)
-    s_val = 0.00
+    s_val = 0.05
     e_val = float(max_val)
     method = "linear"  
     weights = calculate_custom_latent_weights(s_val, e_val, len(sigmas), method, device)
+    
+    n = len(weights)
+    if n > 5:
+        arch_curve = torch.ones(n, device=device)
+        p0 = int(n * 0.2)
+        p1 = int(n * 0.6)
+        arch_curve[:p0] = torch.linspace(0.3, 0.8, p0, device=device)
+        arch_curve[p0:p1] = torch.linspace(0.8, 1.0, p1 - p0, device=device)
+        arch_curve[p1:] = torch.linspace(1.0, 0.4, n - p1, device=device)
+        weights = weights * arch_curve
     weight_map = weights.to(device=sigmas.device, dtype=torch.float32)
 
     style_hook_img = get_style_transfer_hooks(weight_map, style_type, palette_features, 1.0, latent_shape=latent_shape, latent_dim=latent_dim)
@@ -1359,7 +1369,16 @@ def build_style_transfer_lat_model_options(latent_guide_options, sigmas, extra_o
         max_val = float(ref_weight) * float(transfer_str)
         device = sigmas.device
         method = latent_guide_options.get("palette_mode", "ease_in_out")
-        weights = calculate_custom_latent_weights(0.00, float(max_val), len(sigmas), method, device)
+        weights = calculate_custom_latent_weights(0.05, float(max_val), len(sigmas), method, device)
+        n = len(weights)
+        if n > 5:
+            arch_curve = torch.ones(n, device=device)
+            p0 = int(n * 0.2)
+            p1 = int(n * 0.6)
+            arch_curve[:p0] = torch.linspace(0.3, 0.8, p0, device=device)
+            arch_curve[p0:p1] = torch.linspace(0.8, 1.0, p1 - p0, device=device)
+            arch_curve[p1:] = torch.linspace(1.0, 0.4, n - p1, device=device)
+            weights = weights * arch_curve
         weight_map = weights.to(device=sigmas.device, dtype=torch.float32)
 
         style_hook_fn = get_spatial_control_hooks(spatial_features, transfer_str, weight_map, latent_dim=latent_dim)
@@ -1372,9 +1391,18 @@ def build_style_transfer_lat_model_options(latent_guide_options, sigmas, extra_o
 
         max_val = float(ref_weight) * float(transfer_str)
         device = sigmas.device
-        s_val = 0.00
+        s_val = 0.05
         e_val = float(max_val)
         weights = calculate_custom_latent_weights(s_val, e_val, len(sigmas), method, device)
+        n = len(weights)
+        if n > 5:
+            arch_curve = torch.ones(n, device=device)
+            p0 = int(n * 0.2)
+            p1 = int(n * 0.6)
+            arch_curve[:p0] = torch.linspace(0.3, 0.8, p0, device=device)
+            arch_curve[p0:p1] = torch.linspace(0.8, 1.0, p1 - p0, device=device)
+            arch_curve[p1:] = torch.linspace(1.0, 0.4, n - p1, device=device)
+            weights = weights * arch_curve
         weight_map = weights.to(device=sigmas.device, dtype=torch.float32)
 
         style_hook_fn = get_latent_transfer_hooks(transfer_str, style_type, latent_features, weight_map, 1.0, latent_shape=latent_shape, latent_dim=latent_dim)
