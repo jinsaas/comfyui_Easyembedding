@@ -1213,10 +1213,10 @@ def build_style_transfer_model_options(img_guide_options, sigmas, extra_options=
 
 def make_pose_mask(pose_coords, size, original_size=None, device=None):
     """
-    포즈 좌표를 기반으로 특징맵 크기에 맞는 스페이셜 마스크를 생성합니다.
+    Generates a spatial mask matching the feature map size based on the pose coordinates.
     """
     h, w = size
-    # device가 명시되지 않았다면 텐서의 디바이스를 기본으로 사용
+    # If the device is not specified, the tensor's default device is used
     if device is None:
         device = torch.device("cpu")
         
@@ -1225,12 +1225,12 @@ def make_pose_mask(pose_coords, size, original_size=None, device=None):
     if not pose_coords:
         return mask
 
-    # 원본 이미지 크기와 현재 특징맵 크기 간의 비율 계산 (스케일링용)
-    # original_size가 없으면 1:1로 가정하되, 보통 원본 이미지 크기(p_h, p_w)를 넘겨주는 것이 좋습니다.
+    # Calculate the ratio between the original image size and the current feature map size (for scaling)
+    # If original_size is not provided, assume a 1:1 ratio, but it is generally better to pass the original image size (p_h, p_w).
     scale_h = h / original_size[0] if original_size and original_size[0] > 0 else 1.0
     scale_w = w / original_size[1] if original_size and original_size[1] > 0 else 1.0
 
-    # 딕셔너리나 리스트 형태 모두 대응 가능하도록 안전하게 처리
+    # Handle both dictionaries and lists securely to ensure compatibility
     items = pose_coords.items() if isinstance(pose_coords, dict) else enumerate(pose_coords)
 
     for name, coord in items:
@@ -1242,11 +1242,11 @@ def make_pose_mask(pose_coords, size, original_size=None, device=None):
             else:
                 continue
 
-            # 픽셀 좌표를 현재 라텐트/특징맵 크기에 맞게 스케일 변환
+            # Scale transform pixel coordinates to match the current latent/feature map size
             cx = int(x * scale_w)
             cy = int(y * scale_h)
 
-            # 텐서 범위를 벗어나지 않도록 안전하게 슬라이싱 범위 지정
+            # Safely specify slicing bounds to avoid out-of-tensor bounds
             if 0 <= cx < w and 0 <= cy < h:
                 y1, y2 = max(0, cy - 2), min(h, cy + 3)
                 x1, x2 = max(0, cx - 2), min(w, cx + 3)
@@ -2171,6 +2171,7 @@ class EasyClipTextEncodeClamp(IO.ComfyNode):
                 IO.Clip.Input("clip", tooltip="컨디셔닝 처리용 클립 연결"),
                 IO.String.Input("prompt_text", multiline=True, tooltip="프롬프트 입력란"),
                 IO.String.Input("prompt_text_raw", multiline=True, tooltip="프롬프트 입력란(음수 가능)"),
+                IO.Combo.Input("manual_mode", options=["concat", "combine"], default="concat", tooltip="컨디셔닝 결합방식"),
                 IO.Combo.Input("output_settings", options=["conditioning", "embedding output"], default="conditioning", tooltip="출력설정"),
                 IO.String.Input("file_name", default="easyemb_%number", tooltip="파일명 지정"),
                 IO.Combo.Input("emb_opt", options=["basic", "textsave"], default="basic", tooltip="텍스트임베딩 프롬프트 기록 여부")
@@ -2182,7 +2183,7 @@ class EasyClipTextEncodeClamp(IO.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, clip, prompt_text=None, prompt_text_raw=None, output_settings="conditioning", file_name="easyemb_%number", emb_opt="basic") -> IO.NodeOutput:
+    def execute(cls, clip, prompt_text=None, prompt_text_raw=None, manual_mode="concat", output_settings="conditioning", file_name="easyemb_%number", emb_opt="basic") -> IO.NodeOutput:
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -2196,11 +2197,12 @@ class EasyClipTextEncodeClamp(IO.ComfyNode):
         layer_count, layernames = get_layer_count(clip)
             
         if output_settings == "conditioning":
+            cond = process_fields(clip, process_cond, manual_mode, strength=1.0)
             if layer_count > 0:
                 cond_final = []
-                cond_final.extend(node_helpers.conditioning_set_values(process_cond, {"layernum": layer_count, "layers": layernames}, append=False))
+                cond_final.extend(node_helpers.conditioning_set_values(cond, {"layernum": layer_count, "layers": layernames}, append=False))
             else:
-                cond_final = process_cond
+                cond_final = cond
             return IO.NodeOutput(cond_final)
 
         elif output_settings == "embedding output":
@@ -7541,6 +7543,7 @@ EMB_NODE_CLASS_MAPPINGS = {
     "EasyProjectionLayer": EasyProjectionLayer,
     "EasyEmbeddingLoader": EasyEmbeddingLoader,
     "EasyClipTextEncodeSimple": EasyClipTextEncodeSimple,
+    "EasyClipTextEncodeClamp": EasyClipTextEncodeClamp,
     "EasyClipTextEncodeTokenInfo": EasyClipTextEncodeTokenInfo,
     "EasyTranslate": EasyTranslate,
     "EasyClipTextEncodeADV": EasyClipTextEncodeADV,
@@ -7580,6 +7583,7 @@ EMB_NODE_DISPLAY_NAME_MAPPINGS = {
     "ProjectionLayer": "임베딩 로더",
     "EasyEmbeddingLoader": "임베딩 로더",
     "EasyClipTextEncodeSimple": "CLIP 텍스트 인코더 (단순형)",
+    "EasyClipTextEncodeClamp": "CLIP 텍스트 인코더 (클램핑)",
     "EasyClipTextEncodeTokenInfo": "CLIP 텍스트 인코더 (토큰 확인)",
     "EasyTranslate": "번역지원노드",
     "EasyClipTextEncodeADV": "CLIP 텍스트 인코더 어드밴스",
